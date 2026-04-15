@@ -52,7 +52,6 @@ impl CostFunction for BetaBinomialGLM {
     }
 }
 
-// <-- NEW: Added Clone so we can partition the results later
 #[derive(Clone)]
 struct SiteResult {
     chrom: String,
@@ -60,6 +59,8 @@ struct SiteResult {
     mod_type: i32,
     m_frac_ctrl: f64,
     m_frac_treat: f64,
+    n_ctrl: f64,    // <-- NEW: Store control coverage
+    n_treat: f64,   // <-- NEW: Store treatment coverage
     diff_beta: f64,
     p_value: f64,
 }
@@ -77,7 +78,7 @@ fn solve_differential_site(chrom: String, pos: i64, mod_type: i32, ks: Vec<f64>,
     let m_frac_treat = if n_treat > 0.0 { k_treat / n_treat } else { 0.0 };
 
     if n_ctrl == 0.0 || n_treat == 0.0 {
-        return SiteResult { chrom, pos, mod_type, m_frac_ctrl, m_frac_treat, diff_beta: 0.0, p_value: 1.0 };
+        return SiteResult { chrom, pos, mod_type, m_frac_ctrl, m_frac_treat, n_ctrl, n_treat, diff_beta: 0.0, p_value: 1.0 };
     }
 
     let covariates_full: Vec<Vec<f64>> = groups.iter().map(|&g| vec![1.0, g]).collect();
@@ -114,7 +115,7 @@ fn solve_differential_site(chrom: String, pos: i64, mod_type: i32, ks: Vec<f64>,
     let chi_sq = ChiSquared::new(1.0).unwrap();
     let p_value = 1.0 - chi_sq.cdf(lr_stat);
 
-    SiteResult { chrom, pos, mod_type, m_frac_ctrl, m_frac_treat, diff_beta, p_value }
+    SiteResult { chrom, pos, mod_type, m_frac_ctrl, m_frac_treat, n_ctrl, n_treat, diff_beta, p_value }
 }
 
 fn apply_benjamini_hochberg(results: &mut Vec<SiteResult>) -> Vec<f64> {
@@ -145,7 +146,6 @@ fn main() -> Result<()> {
     let treatment_dir = args[2].trim_end_matches('/');
     let output_path = &args[3];
 
-    // Strip the .csv extension so we can append _mod_X to it later
     let base_output_name = output_path.trim_end_matches(".csv");
 
     let control_glob = format!("{}/*.parquet", control_dir);
@@ -200,37 +200,54 @@ fn main() -> Result<()> {
         solve_differential_site(chroms[i].clone(), positions[i], mod_types[i], row_ks, row_ns, row_groups)
     }).collect();
 
-    // <-- NEW: Find all unique modification types present in the data
     let mut unique_mods = mod_types.clone();
     unique_mods.sort_unstable();
     unique_mods.dedup();
 
     println!("Calculations complete. Found {} distinct modification types.", unique_mods.len());
 
-    // <-- NEW: Loop through each unique modification type, partition, and write
     for m_type in unique_mods {
-        println!("Processing FDR and writing CSV for Modification Type: {}...", m_type);
+        let mod_letter = match m_type {
+            0 => "a",
+            1 => "m",
+            2 => "h",
+            _ => "unknown",
+        };
+
+        println!("Processing FDR and writing CSV for Modification Type: {} ({})...", m_type, mod_letter);
         
-        // Filter results just for this specific modification
         let mut type_results: Vec<SiteResult> = results.iter().filter(|r| r.mod_type == m_type).cloned().collect();
 
-        // Apply BH Correction ONLY to this modification type
         let padjs = apply_benjamini_hochberg(&mut type_results);
 
         let out_chroms = Series::new("chrom", type_results.iter().map(|r| r.chrom.as_str()).collect::<Vec<_>>());
         let out_pos = Series::new("pos", type_results.iter().map(|r| r.pos).collect::<Vec<_>>());
-        let out_mod_type = Series::new("mod_type", type_results.iter().map(|r| r.mod_type).collect::<Vec<_>>());
-        let out_mf_ctrl = Series::new("m_frac_ctrl", type_results.iter().map(|r| r.m_frac_ctrl).collect::<Vec<_>>());
-        let out_mf_treat = Series::new("m_frac_treat", type_results.iter().map(|r| r.m_frac_treat).collect::<Vec<_>>());
+        let out_mod_type = Series::new("mod_type", type_results.iter().map(|_| mod_letter).collect::<Vec<_>>());
+        
+        // Construct dynamic column names
+        let col_name_ctrl = format!("{}_frac_ctrl", mod_letter);
+        let col_name_treat = format!("{}_frac_treat", mod_letter);
+        
+        let out_mf_ctrl = Series::new(&col_name_ctrl, type_results.iter().map(|r| r.m_frac_ctrl).collect::<Vec<_>>());
+        let out_mf_treat = Series::new(&col_name_treat, type_results.iter().map(|r| r.m_frac_treat).collect::<Vec<_>>());
+        
+        // <-- NEW: Add the coverage (cast to u32 for clean CSV output)
+        let out_cov_ctrl = Series::new("coverage_ctrl", type_results.iter().map(|r| r.n_ctrl as u32).collect::<Vec<_>>());
+        let out_cov_treat = Series::new("coverage_treat", type_results.iter().map(|r| r.n_treat as u32).collect::<Vec<_>>());
+        
         let out_betas = Series::new("diff_beta", type_results.iter().map(|r| r.diff_beta).collect::<Vec<_>>());
         let out_pvals = Series::new("p_value", type_results.iter().map(|r| r.p_value).collect::<Vec<_>>());
         let out_padjs = Series::new("padj", padjs);
 
+        // Include the new coverage series in the final dataframe
         let mut out_df = DataFrame::new(vec![
-            out_chroms, out_pos, out_mod_type, out_mf_ctrl, out_mf_treat, out_betas, out_pvals, out_padjs
+            out_chroms, out_pos, out_mod_type, 
+            out_mf_ctrl, out_mf_treat, 
+            out_cov_ctrl, out_cov_treat, // <-- NEW
+            out_betas, out_pvals, out_padjs
         ])?;
 
-        let type_output_path = format!("{}_mod_{}.csv", base_output_name, m_type);
+        let type_output_path = format!("{}_{}.csv", base_output_name, mod_letter);
         let mut file = File::create(&type_output_path)?;
         CsvWriter::new(&mut file).finish(&mut out_df)?;
         
