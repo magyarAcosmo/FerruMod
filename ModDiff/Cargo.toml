@@ -1,0 +1,12 @@
+[package]
+name = "ferrumod_stats"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+polars = { version = "0.38", features = ["parquet", "lazy"] }
+argmin = "0.10"
+argmin-math = { version = "0.4", features = ["vec"] } # <--- THE FIX
+statrs = "0.17"
+rayon = "1.10"
+anyhow = "1.0"
