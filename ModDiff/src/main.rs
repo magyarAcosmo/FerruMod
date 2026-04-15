@@ -14,8 +14,9 @@ struct Config {
     mode: String,
     window_size: i64,
     step_size: i64,
-    collapse_thresh: f64, // Raw p-value to trigger window merging (Defaults to 0.05)
-    p_thresh: f64,        // Adjusted p-value to filter final output CSV
+    collapse_thresh: f64,
+    p_thresh: f64,
+    threads: usize,
     control_dir: String,
     treatment_dir: String,
     output_path: String,
@@ -28,8 +29,9 @@ impl Config {
             mode: "dmp".to_string(),
             window_size: 100,
             step_size: 50,
-            collapse_thresh: 0.05, // Hardcoded default for DMR collapsing
-            p_thresh: 1.0,         // Defaults to 1.0 (keep everything) unless specified
+            collapse_thresh: 0.05, 
+            p_thresh: 1.0,         
+            threads: 0, 
             control_dir: String::new(),
             treatment_dir: String::new(),
             output_path: String::new(),
@@ -44,15 +46,16 @@ impl Config {
                 "--dmr" => config.mode = "dmr".to_string(),
                 "--window" => { config.window_size = args[i + 1].parse().unwrap(); i += 1; }
                 "--step" => { config.step_size = args[i + 1].parse().unwrap(); i += 1; }
-                "--collapse-thresh" => { config.collapse_thresh = args[i + 1].parse().unwrap(); i += 1; } // NEW
-                "--p-thresh" => { config.p_thresh = args[i + 1].parse().unwrap(); i += 1; } // NOW CONTROLS FINAL PADJ
+                "--collapse-thresh" => { config.collapse_thresh = args[i + 1].parse().unwrap(); i += 1; } 
+                "--p-thresh" => { config.p_thresh = args[i + 1].parse().unwrap(); i += 1; } 
+                "--threads" => { config.threads = args[i + 1].parse().unwrap(); i += 1; } 
                 _ => positional_args.push(args[i].clone()),
             }
             i += 1;
         }
 
         if positional_args.len() != 3 {
-            eprintln!("Usage: ferrumod_stats [--dmp | --dmr] [--window 100] [--step 50] [--collapse-thresh 0.05] [--p-thresh 0.05] <control_dir> <treat_dir> <out_base.csv>");
+            eprintln!("Usage: ferrumod_stats [--dmp | --dmr] [--window 100] [--step 50] [--collapse-thresh 0.05] [--p-thresh 0.05] [--threads 8] <control_dir> <treat_dir> <out_base.csv>");
             std::process::exit(1);
         }
 
@@ -147,57 +150,70 @@ fn apply_bh(results: &mut Vec<StatResult>) -> Vec<f64> {
     padjs
 }
 
-// --- PURE RUST BASE STRUCTURE ---
 #[derive(Clone)]
 struct BaseStat { pos: i64, k_ctrl: f64, n_ctrl: f64, k_treat: f64, n_treat: f64 }
 
 fn main() -> Result<()> {
     let config = Config::parse();
-    println!("Running FerruMod Stats in [{}] mode.", config.mode.to_uppercase());
+    
+    if config.threads > 0 {
+        rayon::ThreadPoolBuilder::new().num_threads(config.threads).build_global().unwrap();
+        println!("Running FerruMod Stats in [{}] mode (Limited to {} threads).", config.mode.to_uppercase(), config.threads);
+    } else {
+        println!("Running FerruMod Stats in [{}] mode (Using all available cores).", config.mode.to_uppercase());
+    }
 
     let control_glob = format!("{}/*.parquet", config.control_dir);
     let treat_glob = format!("{}/*.parquet", config.treatment_dir);
 
-    // 1. Polars Aggregation: Collapse to base-level stats
+    println!("Scanning and aggregating data via Polars...");
+
     let lf_control = LazyFrame::scan_parquet(&control_glob, Default::default())?.with_column(lit(0.0).alias("group_id"));
     let lf_treat = LazyFrame::scan_parquet(&treat_glob, Default::default())?.with_column(lit(1.0).alias("group_id"));
     let combined = concat(vec![lf_control, lf_treat], UnionArgs::default())?;
 
+    // --- FIX: Use Polars to dynamically pivot the data, eliminating the Rust bottleneck ---
     let aggregated = combined
         .explode([col("mod_offsets"), col("mod_probs"), col("mod_type")]) 
         .with_columns([
             (col("pos") + col("mod_offsets").cast(DataType::Int64)).alias("abs_pos"),
             (col("mod_probs").cast(DataType::Float64) / lit(255.0)).alias("mod_weight")
         ])
-        .group_by([col("chrom"), col("abs_pos"), col("mod_type"), col("group_id")]) 
-        .agg([ col("mod_weight").sum().alias("k"), col("mod_weight").count().alias("n") ])
+        .with_columns([
+            when(col("group_id").eq(lit(0.0))).then(col("mod_weight")).otherwise(lit(0.0)).alias("k_ctrl_weight"),
+            when(col("group_id").eq(lit(0.0))).then(lit(1u32)).otherwise(lit(0u32)).alias("n_ctrl_count"),
+            when(col("group_id").eq(lit(1.0))).then(col("mod_weight")).otherwise(lit(0.0)).alias("k_treat_weight"),
+            when(col("group_id").eq(lit(1.0))).then(lit(1u32)).otherwise(lit(0u32)).alias("n_treat_count"),
+        ])
+        .group_by([col("chrom"), col("abs_pos"), col("mod_type")]) 
+        .agg([ 
+            col("k_ctrl_weight").sum().alias("k_ctrl"), 
+            col("n_ctrl_count").sum().alias("n_ctrl"),
+            col("k_treat_weight").sum().alias("k_treat"), 
+            col("n_treat_count").sum().alias("n_treat") 
+        ])
         .collect()?;
 
-    // 2. Transfer Data to Rust HashMap for fast querying and interval building
+    // 2. Transfer Data to Rust HashMap (Now extremely fast!)
     let mut data_map: HashMap<(String, i32), Vec<BaseStat>> = HashMap::new();
     
     let chroms: Vec<String> = aggregated.column("chrom")?.str()?.into_no_null_iter().map(|s| s.to_string()).collect();
     let positions: Vec<i64> = aggregated.column("abs_pos")?.i64()?.into_no_null_iter().collect();
     let mod_types: Vec<i32> = aggregated.column("mod_type")?.i32()?.into_no_null_iter().collect();
-    let groups: Vec<f64> = aggregated.column("group_id")?.f64()?.into_no_null_iter().collect();
-    let ks: Vec<f64> = aggregated.column("k")?.f64()?.into_no_null_iter().collect();
-    let ns: Vec<u32> = aggregated.column("n")?.u32()?.into_no_null_iter().collect();
+    let k_ctrls: Vec<f64> = aggregated.column("k_ctrl")?.f64()?.into_no_null_iter().collect();
+    let n_ctrls: Vec<u32> = aggregated.column("n_ctrl")?.u32()?.into_no_null_iter().collect();
+    let k_treats: Vec<f64> = aggregated.column("k_treat")?.f64()?.into_no_null_iter().collect();
+    let n_treats: Vec<u32> = aggregated.column("n_treat")?.u32()?.into_no_null_iter().collect();
 
     for i in 0..aggregated.height() {
         let key = (chroms[i].clone(), mod_types[i]);
         let stat = BaseStat {
             pos: positions[i],
-            k_ctrl: if groups[i] == 0.0 { ks[i] } else { 0.0 }, n_ctrl: if groups[i] == 0.0 { ns[i] as f64 } else { 0.0 },
-            k_treat: if groups[i] == 1.0 { ks[i] } else { 0.0 }, n_treat: if groups[i] == 1.0 { ns[i] as f64 } else { 0.0 },
+            k_ctrl: k_ctrls[i], n_ctrl: n_ctrls[i] as f64,
+            k_treat: k_treats[i], n_treat: n_treats[i] as f64,
         };
-        
-        let entry = data_map.entry(key).or_insert_with(Vec::new);
-        if let Some(existing) = entry.iter_mut().find(|b| b.pos == stat.pos) {
-            existing.k_ctrl += stat.k_ctrl; existing.n_ctrl += stat.n_ctrl;
-            existing.k_treat += stat.k_treat; existing.n_treat += stat.n_treat;
-        } else {
-            entry.push(stat);
-        }
+        // O(1) push directly into the HashMap
+        data_map.entry(key).or_insert_with(Vec::new).push(stat);
     }
 
     for bases in data_map.values_mut() { bases.sort_by_key(|b| b.pos); }
@@ -207,6 +223,7 @@ fn main() -> Result<()> {
     if config.mode == "dmp" {
         println!("Calculating Single-Base DMPs...");
         for ((chrom, mod_type), bases) in data_map.into_iter() {
+            // --- This block is where RAYON takes over and pegs your CPU ---
             let mut mod_results: Vec<StatResult> = bases.into_par_iter().map(|b| {
                 solve_glm(&chrom, b.pos, b.pos, mod_type, b.k_ctrl, b.n_ctrl, b.k_treat, b.n_treat)
             }).collect();
@@ -236,7 +253,6 @@ fn main() -> Result<()> {
                 } else { None }
             }).collect();
 
-            // Merge windows based on the new `collapse_thresh`
             let mut sig_windows: Vec<StatResult> = window_results.into_iter().filter(|w| w.p_value < config.collapse_thresh).collect();
             sig_windows.sort_by_key(|w| w.start);
 
@@ -273,7 +289,6 @@ fn main() -> Result<()> {
         
         let all_padjs = apply_bh(&mut type_results);
 
-        // Filter based on the new `p_thresh` controlling final padj
         let mut filtered_results = Vec::new();
         let mut filtered_padjs = Vec::new();
 
