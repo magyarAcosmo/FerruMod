@@ -27,17 +27,17 @@ fn main() -> Result<()> {
     // We assume the input table is 'positions' with columns: sample_name, chrom, start, num_calls, mod_counts
     let query = format!(r#"
         CREATE TABLE windows AS
-        WITH RECURSIVE offsets AS (
-            SELECT 1 AS offset
+        WITH RECURSIVE offset_cte AS (
+            SELECT 1 AS win_offset
             UNION ALL
-            SELECT offset + {step} FROM offsets WHERE offset + {step} < {window}
+            SELECT win_offset + {step} FROM offset_cte WHERE win_offset + {step} < {window}
         ),
         window_map AS (
             SELECT 
                 p.sample_name, p.chrom, p.start, p.num_calls, p.mod_counts,
-                (p.start - ((p.start - o.offset) % {window})) AS win_start
+                (p.start - ((p.start - o.win_offset) % {window})) AS win_start
             FROM positions p
-            CROSS JOIN offsets o
+            CROSS JOIN offset_cte o
         )
         SELECT 
             sample_name, chrom, 
