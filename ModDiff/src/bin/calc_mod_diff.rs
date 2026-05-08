@@ -64,7 +64,7 @@ fn main() -> Result<()> {
     let conn = Connection::open(db_path)?;
     
     // Group windows by coordinate
-    let mut stmt = conn.prepare("SELECT chrom, start, end, sample_name, num_calls, mod_counts FROM windows")?;
+    let mut stmt = conn.prepare("SELECT chrom, start, \"end\", sample_name, num_calls, mod_counts FROM windows")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
