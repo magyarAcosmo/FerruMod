@@ -64,7 +64,7 @@ fn main() -> Result<()> {
     let conn = Connection::open(db_path)?;
     
     // Group windows by coordinate
-    let mut stmt = conn.prepare("SELECT chrom, start, \"end\", sample_name, num_calls, mod_counts FROM windows")?;
+    let mut stmt = conn.prepare("SELECT chrom, start, \"end\", sample_name, CAST(num_calls AS DOUBLE), CAST(mod_counts AS DOUBLE) FROM windows")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
@@ -124,7 +124,7 @@ fn main() -> Result<()> {
 
     println!("Applying FDR and saving to DuckDB...");
     conn.execute("DROP TABLE IF EXISTS mod_diff_windows;", [])?;
-    conn.execute("CREATE TABLE mod_diff_windows (chrom VARCHAR, start BIGINT, end BIGINT, diff_beta DOUBLE, p_value DOUBLE);", [])?;
+    conn.execute("CREATE TABLE mod_diff_windows (chrom VARCHAR, start BIGINT, \"end\" BIGINT, diff_beta DOUBLE, p_value DOUBLE);", [])?;
     
     let mut app = conn.appender("mod_diff_windows")?;
     for (chrom, start, end, beta, p) in results {
