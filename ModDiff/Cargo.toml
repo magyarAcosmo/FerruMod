@@ -1,12 +1,27 @@
 [package]
-name = "ferrumod_stats"
+name = "ModDiff"
 version = "0.1.0"
 edition = "2021"
 
+# Define our 3 separate binaries
+[[bin]]
+name = "summarize_windows"
+path = "src/bin/summarize_windows.rs"
+
+[[bin]]
+name = "calc_mod_diff"
+path = "src/bin/calc_mod_diff.rs"
+
+[[bin]]
+name = "collapse_windows"
+path = "src/bin/collapse_windows.rs"
+
 [dependencies]
-polars = { version = "0.38", features = ["parquet", "lazy"] }
-argmin = "0.10"
-argmin-math = { version = "0.4", features = ["vec"] } # <--- THE FIX
-statrs = "0.17"
+duckdb = { version = "1.0.0", features = ["bundled"] }
+polars = { version = "0.38", features = ["lazy", "csv"] }
 rayon = "1.10"
+argmin = "0.10"
+argmin-math = { version = "0.4", features = ["vec"] }
+statrs = "0.17"
 anyhow = "1.0"
+csv = "1.3"
