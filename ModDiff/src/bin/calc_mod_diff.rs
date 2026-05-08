@@ -8,7 +8,6 @@ use statrs::function::gamma::ln_gamma;
 use std::collections::HashMap;
 use std::env;
 
-// Beta-Binomial GLM capable of N-dimensional covariates
 struct BetaBinomialGLM {
     ks: Vec<f64>, ns: Vec<f64>, covariates: Vec<Vec<f64>>,
 }
@@ -16,7 +15,7 @@ impl CostFunction for BetaBinomialGLM {
     type Param = Vec<f64>; type Output = f64;
     fn cost(&self, p: &Self::Param) -> std::result::Result<Self::Output, argmin::core::Error> {
         let mut ll = 0.0;
-        let rho = 0.05; // Hardcoded dispersion for stability in windows
+        let rho = 0.05; 
         for i in 0..self.ks.len() {
             let (k, n) = (self.ks[i], self.ns[i]);
             let mut xb = 0.0;
@@ -32,7 +31,6 @@ impl CostFunction for BetaBinomialGLM {
     }
 }
 
-// Struct to hold metadata parsing
 struct SampleMeta { group: f64, covariates: Vec<f64> }
 
 fn main() -> Result<()> {
@@ -45,7 +43,6 @@ fn main() -> Result<()> {
     let meta_path = &args[2];
 
     println!("Parsing Metadata...");
-    // Assume CSV format: sample_name, group (0/1), age, etc...
     let mut rdr = csv::Reader::from_path(meta_path)?;
     let mut meta_map: HashMap<String, SampleMeta> = HashMap::new();
     for result in rdr.records() {
@@ -57,13 +54,17 @@ fn main() -> Result<()> {
         meta_map.insert(sample, SampleMeta { group, covariates: covs });
     }
     let num_covariates = meta_map.values().next().unwrap().covariates.len();
-    let null_params = 1 + num_covariates; // Intercept + Covariates
-    let full_params = null_params + 1;    // + Group
+    let null_params = 1 + num_covariates; 
+    let full_params = null_params + 1;    
 
     println!("Querying DB...");
     let conn = Connection::open(db_path)?;
     
-    // Group windows by coordinate
+    // SPEED TWEAK: Unlocked RAM cap and assigned out-of-core temp directory
+    let temp_dir = format!("{}.tmp", db_path);
+    let pragma_query = format!("PRAGMA threads=8; PRAGMA temp_directory='{}';", temp_dir);
+    conn.execute_batch(&pragma_query)?;
+    
     let mut stmt = conn.prepare("SELECT chrom, start, \"end\", sample_name, CAST(num_calls AS DOUBLE), CAST(mod_counts AS DOUBLE) FROM windows")?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -72,7 +73,6 @@ fn main() -> Result<()> {
         ))
     })?;
 
-    // Structure: (chrom, start, end) -> Vec<(sample, n, k)>
     let mut win_data: HashMap<(String, i64, i64), Vec<(String, f64, f64)>> = HashMap::new();
     for r in rows {
         let (chrom, start, end, sample, n, k) = r?;
@@ -81,14 +81,19 @@ fn main() -> Result<()> {
 
     println!("Running Covariate-Aware Beta-Binomial in Parallel...");
     let results: Vec<_> = win_data.into_par_iter().map(|((chrom, start, end), samples)| {
-        let mut ks = vec![]; let mut ns = vec![];
-        let mut cov_full = vec![]; let mut cov_null = vec![];
+        
+        // SPEED TWEAK: Pre-allocating vectors to prevent expensive RAM re-allocation in tight loops
+        let capacity = samples.len();
+        let mut ks = Vec::with_capacity(capacity);
+        let mut ns = Vec::with_capacity(capacity);
+        let mut cov_full = Vec::with_capacity(capacity);
+        let mut cov_null = Vec::with_capacity(capacity);
 
         for (samp, n, k) in samples {
             if let Some(meta) = meta_map.get(&samp) {
                 ks.push(k); ns.push(n);
-                let mut f_row = vec![1.0, meta.group]; // Intercept, Group
-                let mut n_row = vec![1.0];             // Intercept
+                let mut f_row = vec![1.0, meta.group]; 
+                let mut n_row = vec![1.0];             
                 f_row.extend(&meta.covariates);
                 n_row.extend(&meta.covariates);
                 cov_full.push(f_row); cov_null.push(n_row);
@@ -100,7 +105,6 @@ fn main() -> Result<()> {
         let cost_full = BetaBinomialGLM { ks: ks.clone(), ns: ns.clone(), covariates: cov_full };
         let cost_null = BetaBinomialGLM { ks, ns, covariates: cov_null };
 
-        // Dynamically create starting simplexes based on covariate count
         let mut simplex_full = vec![vec![0.0; full_params]; full_params + 1];
         for i in 0..=full_params { if i > 0 { simplex_full[i][i-1] = 0.1; } }
         let mut simplex_null = vec![vec![0.0; null_params]; null_params + 1];

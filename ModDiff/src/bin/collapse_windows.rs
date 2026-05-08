@@ -11,9 +11,14 @@ fn main() -> Result<()> {
     let db_path = &args[1];
 
     let conn = Connection::open(db_path)?;
+    
+    // SPEED TWEAK: Unlocked RAM cap and assigned out-of-core temp directory
+    let temp_dir = format!("{}.tmp", db_path);
+    let pragma_query = format!("PRAGMA threads=8; PRAGMA temp_directory='{}';", temp_dir);
+    conn.execute_batch(&pragma_query)?;
+
     println!("Collapsing windows and recalculating true stats...");
 
-    // 1. Merge contiguous significant windows using pure SQL window functions
     let merge_sql = r#"
         CREATE TEMP TABLE temp_merged AS
         WITH sig_wins AS (
@@ -35,8 +40,6 @@ fn main() -> Result<()> {
     "#;
     conn.execute(merge_sql, [])?;
 
-    // 2. Query back the RAW counts for the new merged boundaries
-    // We join the temp_merged bounds against the raw 'windows' table to get the true pooled read counts
     let agg_sql = r#"
         CREATE TABLE collapsed_dmrs AS
         SELECT 
@@ -49,10 +52,6 @@ fn main() -> Result<()> {
     
     conn.execute("DROP TABLE IF EXISTS collapsed_dmrs;", [])?;
     conn.execute(agg_sql, [])?;
-
-    // From here, you would typically pull the data back into Rust vectors 
-    // and run the EXACT same Beta-Binomial function from `calc_mod_diff.rs` 
-    // to populate a final `final_dmrs` table with adjusted p-values.
     
     println!("DMRs collapsed! Extracted raw counts for recalculated regions into 'collapsed_dmrs'.");
 

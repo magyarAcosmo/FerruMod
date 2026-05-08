@@ -9,19 +9,19 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     let db_path = &args[1];
-    // Window and step are now at index 2 and 3!
     let window_size: i64 = args.get(2).unwrap_or(&"1000".to_string()).parse()?;
     let step_size: i64 = args.get(3).unwrap_or(&"100".to_string()).parse()?;
 
     println!("Connecting to {}...", db_path);
     let conn = Connection::open(db_path)?;
 
-    // Enable heavy multi-threading in DuckDB
-    conn.execute_batch("PRAGMA threads=8; PRAGMA memory_limit='16GB';")?;
+    // SPEED TWEAK: Unlocked RAM cap and assigned out-of-core temp directory
+    let temp_dir = format!("{}.tmp", db_path);
+    let pragma_query = format!("PRAGMA threads=8; PRAGMA temp_directory='{}';", temp_dir);
+    conn.execute_batch(&pragma_query)?;
 
     println!("Step 1: Fast-aggregating raw reads into base-level counts from the 'calls' table...");
     
-    // We strictly pull from 'calls' here without needing it as a variable
     let agg_sql = r#"
         CREATE TEMP TABLE temp_positions AS
         SELECT 
@@ -67,7 +67,11 @@ fn main() -> Result<()> {
     "#, step = step_size, window = window_size);
 
     conn.execute(&query, [])?;
-    println!("Successfully created 'windows' table in the database!");
     
+    // SPEED TWEAK: Create a B-Tree index to supercharge downstream scripts
+    println!("Step 3: Indexing database for high-speed downstream access...");
+    conn.execute("CREATE INDEX idx_windows ON windows(chrom, start, \"end\");", [])?;
+    
+    println!("Successfully created 'windows' table in the database!");
     Ok(())
 }
