@@ -33,10 +33,11 @@ struct SampleMeta { group: f64, covariates: Vec<f64> }
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: collapse_windows_eb <my_data.mod.db> <metadata.csv>");
+        eprintln!("Usage: collapse_windows_eb <my_data.mod.db> <metadata.csv> [min_depth]");
         std::process::exit(1);
     }
     let db_path = &args[1]; let meta_path = &args[2];
+    let min_depth: f64 = args.get(3).unwrap_or(&"0".to_string()).parse().unwrap_or(0.0);
 
     println!("Parsing Metadata...");
     let mut rdr = csv::Reader::from_path(meta_path)?;
@@ -94,6 +95,18 @@ fn main() -> Result<()> {
         let (chrom, start, end, win_count, sample, n, k) = r?;
         win_data.entry((chrom, start, end, win_count)).or_default().push((sample, n, k));
     }
+
+    println!("Filtering collapsed EB regions by minimum depth (>= {} reads per group)...", min_depth);
+    win_data.retain(|_, samples| {
+        let mut g0_depth = 0.0; let mut g1_depth = 0.0;
+        for (samp, n, _) in samples {
+            if let Some(meta) = meta_map.get(samp) {
+                // We added the * in front of n right here!
+                if meta.group == 0.0 { g0_depth += *n; } else { g1_depth += *n; }
+            }
+        }
+        g0_depth >= min_depth && g1_depth >= min_depth
+    });
 
     println!("Pass 1: Estimating raw dispersion across POOLED regions...");
     let mut raw_rhos_map = HashMap::new(); let mut rhos_vec = Vec::with_capacity(win_data.len());

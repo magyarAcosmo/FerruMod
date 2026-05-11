@@ -8,21 +8,18 @@ use statrs::function::gamma::ln_gamma;
 use std::collections::HashMap;
 use std::env;
 
-struct BetaBinomialGLM {
-    ks: Vec<f64>, ns: Vec<f64>, covariates: Vec<Vec<f64>>,
-}
+struct BetaBinomialGLM { ks: Vec<f64>, ns: Vec<f64>, covariates: Vec<Vec<f64>>, rho: f64 }
 impl CostFunction for BetaBinomialGLM {
     type Param = Vec<f64>; type Output = f64;
     fn cost(&self, p: &Self::Param) -> std::result::Result<Self::Output, argmin::core::Error> {
         let mut ll = 0.0;
-        let rho = 0.05; 
         for i in 0..self.ks.len() {
             let (k, n) = (self.ks[i], self.ns[i]);
             let mut xb = 0.0;
             for j in 0..p.len() { xb += self.covariates[i][j] * p[j]; }
             let mut pi = xb.exp() / (1.0 + xb.exp());
             pi = pi.clamp(1e-5, 1.0 - 1e-5);
-            let a = pi * (1.0 - rho) / rho; let b = (1.0 - pi) * (1.0 - rho) / rho;
+            let a = pi * (1.0 - self.rho) / self.rho; let b = (1.0 - pi) * (1.0 - self.rho) / self.rho;
             ll += ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)
                 + ln_gamma(k + a) + ln_gamma(n - k + b) - ln_gamma(n + a + b)
                 + ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b);
@@ -36,40 +33,34 @@ struct SampleMeta { group: f64, covariates: Vec<f64> }
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: calc_mod_diff <mod.db> <metadata.csv>");
+        eprintln!("Usage: calc_mod_diff <mod.db> <metadata.csv> [min_depth]");
         std::process::exit(1);
     }
-    let db_path = &args[1];
-    let meta_path = &args[2];
+    let db_path = &args[1]; let meta_path = &args[2];
+    let min_depth: f64 = args.get(3).unwrap_or(&"0".to_string()).parse().unwrap_or(0.0);
 
     println!("Parsing Metadata...");
     let mut rdr = csv::Reader::from_path(meta_path)?;
     let mut meta_map: HashMap<String, SampleMeta> = HashMap::new();
     for result in rdr.records() {
         let record = result?;
-        let sample = record[0].to_string();
-        let group: f64 = record[1].parse().unwrap();
-        let mut covs = vec![];
-        for i in 2..record.len() { covs.push(record[i].parse().unwrap()); }
+        let sample = record[0].to_string(); let group: f64 = record[1].parse().unwrap();
+        let mut covs = vec![]; for i in 2..record.len() { covs.push(record[i].parse().unwrap()); }
         meta_map.insert(sample, SampleMeta { group, covariates: covs });
     }
     let num_covariates = meta_map.values().next().unwrap().covariates.len();
-    let null_params = 1 + num_covariates; 
-    let full_params = null_params + 1;    
+    let null_params = 1 + num_covariates; let full_params = null_params + 1;    
 
-    println!("Querying DB...");
     let conn = Connection::open(db_path)?;
-    
     let temp_dir = format!("{}.tmp", db_path);
     let pragma_query = format!("PRAGMA threads=8; PRAGMA temp_directory='{}';", temp_dir);
     conn.execute_batch(&pragma_query)?;
     
+    println!("Querying DB...");
     let mut stmt = conn.prepare("SELECT chrom, start, \"end\", sample_name, CAST(num_calls AS DOUBLE), CAST(mod_counts AS DOUBLE) FROM windows")?;
     let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?, row.get::<_, f64>(4)?, row.get::<_, f64>(5)?
-        ))
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, f64>(4)?, row.get::<_, f64>(5)?))
     })?;
 
     let mut win_data: HashMap<(String, i64, i64), Vec<(String, f64, f64)>> = HashMap::new();
@@ -78,28 +69,50 @@ fn main() -> Result<()> {
         win_data.entry((chrom, start, end)).or_default().push((sample, n, k));
     }
 
-    println!("Running Covariate-Aware Beta-Binomial in Parallel...");
+    println!("Filtering windows by minimum depth (>= {} reads per group)...", min_depth);
+    win_data.retain(|_, samples| {
+        let mut g0_depth = 0.0; let mut g1_depth = 0.0;
+        for (samp, n, _) in samples {
+            if let Some(meta) = meta_map.get(samp) {
+                // We added the * in front of n right here!
+                if meta.group == 0.0 { g0_depth += *n; } else { g1_depth += *n; }
+            }
+        }
+        g0_depth >= min_depth && g1_depth >= min_depth
+    });
+
+    println!("Running Covariate-Aware Beta-Binomial with Dynamic Dispersion...");
     let raw_results: Vec<_> = win_data.into_par_iter().map(|((chrom, start, end), samples)| {
-        let capacity = samples.len();
-        let mut ks = Vec::with_capacity(capacity);
-        let mut ns = Vec::with_capacity(capacity);
-        let mut cov_full = Vec::with_capacity(capacity);
-        let mut cov_null = Vec::with_capacity(capacity);
+        let capacity = samples.len(); let s_count = capacity as f64;
+        let mut ks = Vec::with_capacity(capacity); let mut ns = Vec::with_capacity(capacity);
+        let mut cov_full = Vec::with_capacity(capacity); let mut cov_null = Vec::with_capacity(capacity);
+
+        // Pass 1: Calculate raw rho dynamically for this specific window
+        let mut raw_rho = 1e-4; 
+        if s_count > 1.0 {
+            let (mut total_n, mut total_k) = (0.0, 0.0);
+            for (_, n, k) in &samples { total_n += n; total_k += k; }
+            let p_bar = total_k / total_n; let n_bar = total_n / s_count;
+            let mut s2 = 0.0;
+            for (_, n, k) in &samples { let p_s = k / n; s2 += (p_s - p_bar).powi(2); }
+            s2 /= s_count - 1.0;
+            let binom_v = (p_bar * (1.0 - p_bar)) / n_bar;
+            if s2 > binom_v && p_bar > 0.0 && p_bar < 1.0 { raw_rho = (s2 - binom_v) / ((p_bar * (1.0 - p_bar)) - binom_v).max(1e-10); }
+        }
+        raw_rho = raw_rho.clamp(1e-5, 0.99);
 
         for (samp, n, k) in samples {
             if let Some(meta) = meta_map.get(&samp) {
                 ks.push(k); ns.push(n);
-                let mut f_row = vec![1.0, meta.group]; 
-                let mut n_row = vec![1.0];             
-                f_row.extend(&meta.covariates);
-                n_row.extend(&meta.covariates);
+                let mut f_row = vec![1.0, meta.group]; let mut n_row = vec![1.0];             
+                f_row.extend(&meta.covariates); n_row.extend(&meta.covariates);
                 cov_full.push(f_row); cov_null.push(n_row);
             }
         }
         if ks.is_empty() { return None; }
 
-        let cost_full = BetaBinomialGLM { ks: ks.clone(), ns: ns.clone(), covariates: cov_full };
-        let cost_null = BetaBinomialGLM { ks, ns, covariates: cov_null };
+        let cost_full = BetaBinomialGLM { ks: ks.clone(), ns: ns.clone(), covariates: cov_full, rho: raw_rho };
+        let cost_null = BetaBinomialGLM { ks, ns, covariates: cov_null, rho: raw_rho };
 
         let mut simplex_full = vec![vec![0.0; full_params]; full_params + 1];
         for i in 0..=full_params { if i > 0 { simplex_full[i][i-1] = 0.1; } }
@@ -108,7 +121,6 @@ fn main() -> Result<()> {
 
         let s_full = NelderMead::new(simplex_full).with_sd_tolerance(1e-4).unwrap();
         let s_null = NelderMead::new(simplex_null).with_sd_tolerance(1e-4).unwrap();
-
         let r_full = Executor::new(cost_full, s_full).configure(|state| state.max_iters(100)).run();
         let r_null = Executor::new(cost_null, s_null).configure(|state| state.max_iters(100)).run();
 
@@ -119,36 +131,32 @@ fn main() -> Result<()> {
         let lr_stat = (2.0 * (ll_full - ll_null)).max(1e-10_f64);
         let p_value = 1.0 - ChiSquared::new(1.0).unwrap().cdf(lr_stat);
 
-        Some((chrom, start, end, diff_beta, p_value))
+        Some((chrom, start, end, diff_beta, p_value, raw_rho))
     }).filter_map(|x| x).collect();
 
     println!("Applying Benjamini-Hochberg (FDR) Correction...");
     let mut results_with_idx: Vec<(usize, _)> = raw_results.into_iter().enumerate().collect();
-    // Sort descending by raw p-value
     results_with_idx.sort_by(|a, b| b.1.4.partial_cmp(&a.1.4).unwrap_or(std::cmp::Ordering::Equal));
     
     let n = results_with_idx.len() as f64;
-    let mut min_adj_p = 1.0;
-    let mut final_results = vec![None; results_with_idx.len()];
+    let mut min_adj_p = 1.0; let mut final_results = vec![None; results_with_idx.len()];
 
     for (i, (orig_idx, data)) in results_with_idx.into_iter().enumerate() {
-        let rank = n - (i as f64);
-        let raw_p = data.4;
+        let rank = n - (i as f64); let raw_p = data.4;
         let mut adj_p = raw_p * (n / rank);
         if adj_p > 1.0 { adj_p = 1.0; }
         if adj_p < min_adj_p { min_adj_p = adj_p; } else { adj_p = min_adj_p; }
-        // (chrom, start, end, diff_beta, p_value, adj_p_value)
-        final_results[orig_idx] = Some((data.0, data.1, data.2, data.3, raw_p, adj_p));
+        final_results[orig_idx] = Some((data.0, data.1, data.2, data.3, raw_p, adj_p, data.5));
     }
     let results: Vec<_> = final_results.into_iter().map(|x| x.unwrap()).collect();
 
     println!("Saving to DuckDB...");
     conn.execute("DROP TABLE IF EXISTS mod_diff_windows;", [])?;
-    conn.execute("CREATE TABLE mod_diff_windows (chrom VARCHAR, start BIGINT, \"end\" BIGINT, diff_beta DOUBLE, p_value DOUBLE, adj_p_value DOUBLE);", [])?;
+    conn.execute("CREATE TABLE mod_diff_windows (chrom VARCHAR, start BIGINT, \"end\" BIGINT, diff_beta DOUBLE, p_value DOUBLE, adj_p_value DOUBLE, calculated_rho DOUBLE);", [])?;
     
     let mut app = conn.appender("mod_diff_windows")?;
-    for (chrom, start, end, beta, p, adj_p) in results {
-        app.append_row([duckdb::types::ToSqlOutput::from(chrom), start.into(), end.into(), beta.into(), p.into(), adj_p.into()])?;
+    for (chrom, start, end, beta, p, adj_p, rho) in results {
+        app.append_row([duckdb::types::ToSqlOutput::from(chrom), start.into(), end.into(), beta.into(), p.into(), adj_p.into(), rho.into()])?;
     }
     
     println!("Differential analysis complete!");
