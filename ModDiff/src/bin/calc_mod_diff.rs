@@ -60,7 +60,6 @@ fn main() -> Result<()> {
     println!("Querying DB...");
     let conn = Connection::open(db_path)?;
     
-    // SPEED TWEAK: Unlocked RAM cap and assigned out-of-core temp directory
     let temp_dir = format!("{}.tmp", db_path);
     let pragma_query = format!("PRAGMA threads=8; PRAGMA temp_directory='{}';", temp_dir);
     conn.execute_batch(&pragma_query)?;
@@ -80,9 +79,7 @@ fn main() -> Result<()> {
     }
 
     println!("Running Covariate-Aware Beta-Binomial in Parallel...");
-    let results: Vec<_> = win_data.into_par_iter().map(|((chrom, start, end), samples)| {
-        
-        // SPEED TWEAK: Pre-allocating vectors to prevent expensive RAM re-allocation in tight loops
+    let raw_results: Vec<_> = win_data.into_par_iter().map(|((chrom, start, end), samples)| {
         let capacity = samples.len();
         let mut ks = Vec::with_capacity(capacity);
         let mut ns = Vec::with_capacity(capacity);
@@ -99,7 +96,6 @@ fn main() -> Result<()> {
                 cov_full.push(f_row); cov_null.push(n_row);
             }
         }
-
         if ks.is_empty() { return None; }
 
         let cost_full = BetaBinomialGLM { ks: ks.clone(), ns: ns.clone(), covariates: cov_full };
@@ -126,13 +122,33 @@ fn main() -> Result<()> {
         Some((chrom, start, end, diff_beta, p_value))
     }).filter_map(|x| x).collect();
 
-    println!("Applying FDR and saving to DuckDB...");
+    println!("Applying Benjamini-Hochberg (FDR) Correction...");
+    let mut results_with_idx: Vec<(usize, _)> = raw_results.into_iter().enumerate().collect();
+    // Sort descending by raw p-value
+    results_with_idx.sort_by(|a, b| b.1.4.partial_cmp(&a.1.4).unwrap_or(std::cmp::Ordering::Equal));
+    
+    let n = results_with_idx.len() as f64;
+    let mut min_adj_p = 1.0;
+    let mut final_results = vec![None; results_with_idx.len()];
+
+    for (i, (orig_idx, data)) in results_with_idx.into_iter().enumerate() {
+        let rank = n - (i as f64);
+        let raw_p = data.4;
+        let mut adj_p = raw_p * (n / rank);
+        if adj_p > 1.0 { adj_p = 1.0; }
+        if adj_p < min_adj_p { min_adj_p = adj_p; } else { adj_p = min_adj_p; }
+        // (chrom, start, end, diff_beta, p_value, adj_p_value)
+        final_results[orig_idx] = Some((data.0, data.1, data.2, data.3, raw_p, adj_p));
+    }
+    let results: Vec<_> = final_results.into_iter().map(|x| x.unwrap()).collect();
+
+    println!("Saving to DuckDB...");
     conn.execute("DROP TABLE IF EXISTS mod_diff_windows;", [])?;
-    conn.execute("CREATE TABLE mod_diff_windows (chrom VARCHAR, start BIGINT, \"end\" BIGINT, diff_beta DOUBLE, p_value DOUBLE);", [])?;
+    conn.execute("CREATE TABLE mod_diff_windows (chrom VARCHAR, start BIGINT, \"end\" BIGINT, diff_beta DOUBLE, p_value DOUBLE, adj_p_value DOUBLE);", [])?;
     
     let mut app = conn.appender("mod_diff_windows")?;
-    for (chrom, start, end, beta, p) in results {
-        app.append_row([duckdb::types::ToSqlOutput::from(chrom), start.into(), end.into(), beta.into(), p.into()])?;
+    for (chrom, start, end, beta, p, adj_p) in results {
+        app.append_row([duckdb::types::ToSqlOutput::from(chrom), start.into(), end.into(), beta.into(), p.into(), adj_p.into()])?;
     }
     
     println!("Differential analysis complete!");
