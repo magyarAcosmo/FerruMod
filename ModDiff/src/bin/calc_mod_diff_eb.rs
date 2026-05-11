@@ -1,0 +1,183 @@
+use anyhow::Result;
+use argmin::core::{CostFunction, Executor, State};
+use argmin::solver::neldermead::NelderMead;
+use duckdb::Connection;
+use rayon::prelude::*;
+use statrs::distribution::{ChiSquared, ContinuousCDF};
+use statrs::function::gamma::ln_gamma;
+use std::collections::HashMap;
+use std::env;
+
+// TWEAK: The struct now accepts a dynamic 'rho' for each specific window
+struct BetaBinomialGLM {
+    ks: Vec<f64>, ns: Vec<f64>, covariates: Vec<Vec<f64>>, rho: f64
+}
+impl CostFunction for BetaBinomialGLM {
+    type Param = Vec<f64>; type Output = f64;
+    fn cost(&self, p: &Self::Param) -> std::result::Result<Self::Output, argmin::core::Error> {
+        let mut ll = 0.0;
+        for i in 0..self.ks.len() {
+            let (k, n) = (self.ks[i], self.ns[i]);
+            let mut xb = 0.0;
+            for j in 0..p.len() { xb += self.covariates[i][j] * p[j]; }
+            let mut pi = xb.exp() / (1.0 + xb.exp());
+            pi = pi.clamp(1e-5, 1.0 - 1e-5);
+            let a = pi * (1.0 - self.rho) / self.rho; let b = (1.0 - pi) * (1.0 - self.rho) / self.rho;
+            ll += ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)
+                + ln_gamma(k + a) + ln_gamma(n - k + b) - ln_gamma(n + a + b)
+                + ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b);
+        }
+        Ok(-ll)
+    }
+}
+
+struct SampleMeta { group: f64, covariates: Vec<f64> }
+
+fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 3 {
+        eprintln!("Usage: calc_mod_diff_eb <mod.db> <metadata.csv>");
+        std::process::exit(1);
+    }
+    let db_path = &args[1];
+    let meta_path = &args[2];
+
+    println!("Parsing Metadata...");
+    let mut rdr = csv::Reader::from_path(meta_path)?;
+    let mut meta_map: HashMap<String, SampleMeta> = HashMap::new();
+    for result in rdr.records() {
+        let record = result?;
+        let sample = record[0].to_string();
+        let group: f64 = record[1].parse().unwrap();
+        let mut covs = vec![];
+        for i in 2..record.len() { covs.push(record[i].parse().unwrap()); }
+        meta_map.insert(sample, SampleMeta { group, covariates: covs });
+    }
+    let num_covariates = meta_map.values().next().unwrap().covariates.len();
+    let null_params = 1 + num_covariates; 
+    let full_params = null_params + 1;    
+
+    println!("Querying DB...");
+    let conn = Connection::open(db_path)?;
+    
+    let temp_dir = format!("{}.tmp", db_path);
+    let pragma_query = format!("PRAGMA threads=8; PRAGMA temp_directory='{}';", temp_dir);
+    conn.execute_batch(&pragma_query)?;
+    
+    let mut stmt = conn.prepare("SELECT chrom, start, \"end\", sample_name, CAST(num_calls AS DOUBLE), CAST(mod_counts AS DOUBLE) FROM windows")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, f64>(4)?, row.get::<_, f64>(5)?
+        ))
+    })?;
+
+    let mut win_data: HashMap<(String, i64, i64), Vec<(String, f64, f64)>> = HashMap::new();
+    for r in rows {
+        let (chrom, start, end, sample, n, k) = r?;
+        win_data.entry((chrom, start, end)).or_default().push((sample, n, k));
+    }
+
+    println!("Pass 1: Estimating raw dispersion across all windows...");
+    let mut raw_rhos_map = HashMap::new();
+    let mut rhos_vec = Vec::with_capacity(win_data.len());
+
+    for ((chrom, start, end), samples) in &win_data {
+        let s_count = samples.len() as f64;
+        let mut raw_rho = 1e-4; // Default minimal noise
+        
+        if s_count > 1.0 {
+            let (mut total_n, mut total_k) = (0.0, 0.0);
+            for (_, n, k) in samples { total_n += n; total_k += k; }
+            let p_bar = total_k / total_n;
+            let n_bar = total_n / s_count;
+
+            let mut s2 = 0.0;
+            for (_, n, k) in samples {
+                let p_s = k / n;
+                s2 += (p_s - p_bar).powi(2);
+            }
+            s2 /= s_count - 1.0;
+
+            let binom_v = (p_bar * (1.0 - p_bar)) / n_bar;
+            if s2 > binom_v && p_bar > 0.0 && p_bar < 1.0 {
+                raw_rho = (s2 - binom_v) / ((p_bar * (1.0 - p_bar)) - binom_v).max(1e-10);
+            }
+        }
+        raw_rho = raw_rho.clamp(1e-5, 0.99);
+        raw_rhos_map.insert((chrom.clone(), *start, *end), raw_rho);
+        rhos_vec.push(raw_rho);
+    }
+
+    println!("Pass 2: Calculating Empirical Bayes Global Prior...");
+    rhos_vec.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let global_prior = if rhos_vec.is_empty() { 0.05 } else { rhos_vec[rhos_vec.len() / 2] };
+    println!("Global Baseline Dispersion (Prior): {:.4}", global_prior);
+
+    println!("Pass 3: Running Covariate-Aware Shrunk Beta-Binomial in Parallel...");
+    let results: Vec<_> = win_data.into_par_iter().map(|((chrom, start, end), samples)| {
+        
+        let capacity = samples.len();
+        let s_count = capacity as f64;
+        let mut ks = Vec::with_capacity(capacity);
+        let mut ns = Vec::with_capacity(capacity);
+        let mut cov_full = Vec::with_capacity(capacity);
+        let mut cov_null = Vec::with_capacity(capacity);
+
+        for (samp, n, k) in samples {
+            if let Some(meta) = meta_map.get(&samp) {
+                ks.push(k); ns.push(n);
+                let mut f_row = vec![1.0, meta.group]; 
+                let mut n_row = vec![1.0];             
+                f_row.extend(&meta.covariates);
+                n_row.extend(&meta.covariates);
+                cov_full.push(f_row); cov_null.push(n_row);
+            }
+        }
+
+        if ks.is_empty() { return None; }
+
+        // APPLY BAYESIAN SHRINKAGE
+        // We weight the global prior as 10 pseudo-observations (standard genomics df0)
+        let raw_rho = raw_rhos_map.get(&(chrom.clone(), start, end)).unwrap();
+        let df_prior = 10.0; 
+        let rho_shrunk = ((raw_rho * s_count) + (global_prior * df_prior)) / (s_count + df_prior);
+
+        // Inject the shrunk rho into the GLM
+        let cost_full = BetaBinomialGLM { ks: ks.clone(), ns: ns.clone(), covariates: cov_full, rho: rho_shrunk };
+        let cost_null = BetaBinomialGLM { ks, ns, covariates: cov_null, rho: rho_shrunk };
+
+        let mut simplex_full = vec![vec![0.0; full_params]; full_params + 1];
+        for i in 0..=full_params { if i > 0 { simplex_full[i][i-1] = 0.1; } }
+        let mut simplex_null = vec![vec![0.0; null_params]; null_params + 1];
+        for i in 0..=null_params { if i > 0 { simplex_null[i][i-1] = 0.1; } }
+
+        let s_full = NelderMead::new(simplex_full).with_sd_tolerance(1e-4).unwrap();
+        let s_null = NelderMead::new(simplex_null).with_sd_tolerance(1e-4).unwrap();
+
+        let r_full = Executor::new(cost_full, s_full).configure(|state| state.max_iters(100)).run();
+        let r_null = Executor::new(cost_null, s_null).configure(|state| state.max_iters(100)).run();
+
+        let mut diff_beta = 0.0_f64; let mut ll_full = 0.0_f64; let mut ll_null = 0.0_f64;
+        if let Ok(opt) = r_full { ll_full = -opt.state().get_best_cost(); diff_beta = opt.state().get_best_param().unwrap()[1]; }
+        if let Ok(opt) = r_null { ll_null = -opt.state().get_best_cost(); }
+
+        let lr_stat = (2.0 * (ll_full - ll_null)).max(1e-10_f64);
+        let p_value = 1.0 - ChiSquared::new(1.0).unwrap().cdf(lr_stat);
+
+        Some((chrom, start, end, diff_beta, p_value, rho_shrunk))
+    }).filter_map(|x| x).collect();
+
+    println!("Saving Empirical Bayes stats to DuckDB...");
+    conn.execute("DROP TABLE IF EXISTS mod_diff_windows_eb;", [])?;
+    // Notice the new output table name and extra column for tracking the shrunk variance
+    conn.execute("CREATE TABLE mod_diff_windows_eb (chrom VARCHAR, start BIGINT, \"end\" BIGINT, diff_beta DOUBLE, p_value DOUBLE, shrunk_rho DOUBLE);", [])?;
+    
+    let mut app = conn.appender("mod_diff_windows_eb")?;
+    for (chrom, start, end, beta, p, rho) in results {
+        app.append_row([duckdb::types::ToSqlOutput::from(chrom), start.into(), end.into(), beta.into(), p.into(), rho.into()])?;
+    }
+    
+    println!("Empirical Bayes differential analysis complete!");
+    Ok(())
+}

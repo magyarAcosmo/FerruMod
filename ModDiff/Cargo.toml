@@ -3,7 +3,6 @@ name = "ModDiff"
 version = "0.1.0"
 edition = "2021"
 
-# Define our 3 separate binaries
 [[bin]]
 name = "summarize_windows"
 path = "src/bin/summarize_windows.rs"
@@ -15,6 +14,15 @@ path = "src/bin/calc_mod_diff.rs"
 [[bin]]
 name = "collapse_windows"
 path = "src/bin/collapse_windows.rs"
+
+# --- NEW EMPIRICAL BAYES TRACK ---
+[[bin]]
+name = "calc_mod_diff_eb"
+path = "src/bin/calc_mod_diff_eb.rs"
+
+[[bin]]
+name = "collapse_windows_eb"
+path = "src/bin/collapse_windows_eb.rs"
 
 [dependencies]
 duckdb = { version = "1.0.0", features = ["bundled"] }
