@@ -22,8 +22,10 @@ fn main() -> Result<()> {
 
     println!("Step 1: Fast-aggregating raw reads into base-level counts from the 'calls' table...");
     
+    // In summarize_windows.rs, change Step 1 to this:
     let agg_sql = r#"
-        CREATE TEMP TABLE temp_positions AS
+        DROP TABLE IF EXISTS base_counts;
+        CREATE TABLE base_counts AS
         SELECT 
             sample_name, 
             chrom, 
@@ -33,6 +35,8 @@ fn main() -> Result<()> {
         FROM calls
         WHERE start IS NOT NULL
         GROUP BY sample_name, chrom, start;
+        
+        CREATE INDEX idx_base_counts ON base_counts(chrom, start);
     "#;
     conn.execute(agg_sql, [])?;
 
@@ -51,7 +55,7 @@ fn main() -> Result<()> {
                 p.sample_name, p.chrom, p.start, 
                 p.num_calls, p.mod_counts,
                 (p.start - ((p.start - o.win_offset) % {window})) AS win_start
-            FROM temp_positions p
+            FROM base_counts p
             CROSS JOIN offset_cte o
         )
         SELECT 

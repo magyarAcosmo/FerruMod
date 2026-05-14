@@ -80,10 +80,11 @@ fn main() -> Result<()> {
 
     println!("Querying pooled read counts for final stats...");
     let mut stmt = conn.prepare(r#"
-        SELECT m.chrom, m.start, m."end", m.win_count, w.sample_name, CAST(SUM(w.num_calls) AS DOUBLE), CAST(SUM(w.mod_counts) AS DOUBLE)
+        SELECT m.chrom, m.start, m."end", m.win_count, b.sample_name, 
+               CAST(SUM(b.num_calls) AS DOUBLE), CAST(SUM(b.mod_counts) AS DOUBLE)
         FROM temp_merged m
-        JOIN windows w ON m.chrom = w.chrom AND w.start >= m.start AND w."end" <= m."end"
-        GROUP BY m.chrom, m.start, m."end", m.win_count, w.sample_name
+        JOIN base_counts b ON m.chrom = b.chrom AND b.start >= m.start AND b.start <= m."end"
+        GROUP BY m.chrom, m.start, m."end", m.win_count, b.sample_name
     "#)?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?,
