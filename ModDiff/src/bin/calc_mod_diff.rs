@@ -74,7 +74,6 @@ fn main() -> Result<()> {
         let mut g0_depth = 0.0; let mut g1_depth = 0.0;
         for (samp, n, _) in samples {
             if let Some(meta) = meta_map.get(samp) {
-                // We added the * in front of n right here!
                 if meta.group == 0.0 { g0_depth += *n; } else { g1_depth += *n; }
             }
         }
@@ -87,12 +86,13 @@ fn main() -> Result<()> {
         let mut ks = Vec::with_capacity(capacity); let mut ns = Vec::with_capacity(capacity);
         let mut cov_full = Vec::with_capacity(capacity); let mut cov_null = Vec::with_capacity(capacity);
 
-        // Pass 1: Calculate raw rho dynamically for this specific window
+        let (mut total_n, mut total_k) = (0.0, 0.0);
+        for (_, n, k) in &samples { total_n += n; total_k += k; }
+        let p_bar = if total_n > 0.0 { total_k / total_n } else { 0.5 };
+        
         let mut raw_rho = 1e-4; 
         if s_count > 1.0 {
-            let (mut total_n, mut total_k) = (0.0, 0.0);
-            for (_, n, k) in &samples { total_n += n; total_k += k; }
-            let p_bar = total_k / total_n; let n_bar = total_n / s_count;
+            let n_bar = total_n / s_count;
             let mut s2 = 0.0;
             for (_, n, k) in &samples { let p_s = k / n; s2 += (p_s - p_bar).powi(2); }
             s2 /= s_count - 1.0;
@@ -100,6 +100,10 @@ fn main() -> Result<()> {
             if s2 > binom_v && p_bar > 0.0 && p_bar < 1.0 { raw_rho = (s2 - binom_v) / ((p_bar * (1.0 - p_bar)) - binom_v).max(1e-10); }
         }
         raw_rho = raw_rho.clamp(1e-5, 0.99);
+
+        // Smart start calculation
+        let p_avg = p_bar.clamp(1e-4, 1.0 - 1e-4);
+        let intercept_start = (p_avg / (1.0 - p_avg)).ln();
 
         for (samp, n, k) in samples {
             if let Some(meta) = meta_map.get(&samp) {
@@ -115,14 +119,22 @@ fn main() -> Result<()> {
         let cost_null = BetaBinomialGLM { ks, ns, covariates: cov_null, rho: raw_rho };
 
         let mut simplex_full = vec![vec![0.0; full_params]; full_params + 1];
-        for i in 0..=full_params { if i > 0 { simplex_full[i][i-1] = 0.1; } }
+        for i in 0..=full_params { 
+            simplex_full[i][0] = intercept_start; 
+            if i > 0 { simplex_full[i][i-1] = 0.5; } 
+        }
+        
         let mut simplex_null = vec![vec![0.0; null_params]; null_params + 1];
-        for i in 0..=null_params { if i > 0 { simplex_null[i][i-1] = 0.1; } }
+        for i in 0..=null_params { 
+            simplex_null[i][0] = intercept_start; 
+            if i > 0 { simplex_null[i][i-1] = 0.5; } 
+        }
 
-        let s_full = NelderMead::new(simplex_full).with_sd_tolerance(1e-4).unwrap();
-        let s_null = NelderMead::new(simplex_null).with_sd_tolerance(1e-4).unwrap();
-        let r_full = Executor::new(cost_full, s_full).configure(|state| state.max_iters(100)).run();
-        let r_null = Executor::new(cost_null, s_null).configure(|state| state.max_iters(100)).run();
+        let s_full = NelderMead::new(simplex_full).with_sd_tolerance(1e-6).unwrap();
+        let s_null = NelderMead::new(simplex_null).with_sd_tolerance(1e-6).unwrap();
+        
+        let r_full = Executor::new(cost_full, s_full).configure(|state| state.max_iters(2500)).run();
+        let r_null = Executor::new(cost_null, s_null).configure(|state| state.max_iters(2500)).run();
 
         let mut diff_beta = 0.0_f64; let mut ll_full = 0.0_f64; let mut ll_null = 0.0_f64;
         if let Ok(opt) = r_full { ll_full = -opt.state().get_best_cost(); diff_beta = opt.state().get_best_param().unwrap()[1]; }
