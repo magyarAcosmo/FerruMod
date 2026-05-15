@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     conn.execute_batch(&pragma_query)?;
     
     println!("Querying DB...");
-    let mut stmt = conn.prepare("SELECT chrom, start, \"end\", sample_name, CAST(num_calls AS DOUBLE), CAST(mod_counts AS DOUBLE), CAST(num_CpGs AS DOUBLE) FROM windows")?;
+    let mut stmt = conn.prepare("SELECT chrom, start, \"end\", sample_name, CAST(num_calls AS DOUBLE), CAST(mod_counts AS DOUBLE), CAST(num_sites AS DOUBLE) FROM windows")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
             row.get::<_, String>(3)?, row.get::<_, f64>(4)?, row.get::<_, f64>(5)?, row.get::<_, f64>(6)?))

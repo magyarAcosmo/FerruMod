@@ -10,72 +10,93 @@ fn main() -> Result<()> {
     }
     let db_path = &args[1];
     let window_size: i64 = args.get(2).unwrap_or(&"1000".to_string()).parse()?;
-    let step_size: i64 = args.get(3).unwrap_or(&"100".to_string()).parse()?;
+    let step_size: i64 = args.get(3).unwrap_or(&"10".to_string()).parse()?;
 
     println!("Connecting to {}...", db_path);
     let conn = Connection::open(db_path)?;
 
-    // SPEED TWEAK: Unlocked RAM cap and assigned out-of-core temp directory
+    // Resource Pragmas
     let temp_dir = format!("{}.tmp", db_path);
     let pragma_query = format!("PRAGMA threads=8; PRAGMA temp_directory='{}';", temp_dir);
     conn.execute_batch(&pragma_query)?;
 
-    println!("Step 1: Fast-aggregating raw reads into base-level counts from the 'calls' table...");
-    
-    // In summarize_windows.rs, change Step 1 to this:
-    let agg_sql = r#"
-        DROP TABLE IF EXISTS base_counts;
-        CREATE TABLE base_counts AS
-        SELECT 
-            sample_name, 
-            chrom, 
-            CAST(start AS BIGINT) AS start, 
-            COUNT(*) AS num_calls, 
-            SUM(CASE WHEN call_code IN ('m', 'h') THEN 1 ELSE 0 END) AS mod_counts
-        FROM calls
-        WHERE start IS NOT NULL
-        GROUP BY sample_name, chrom, start;
-        
-        CREATE INDEX idx_base_counts ON base_counts(chrom, start);
-    "#;
-    conn.execute(agg_sql, [])?;
-
-    println!("Step 2: Building staggered sliding windows (Window: {}bp, Step: {}bp)...", window_size, step_size);
+    // Create the final empty table matching the R script's logic
+    println!("Initializing 'windows' table...");
     conn.execute("DROP TABLE IF EXISTS windows;", [])?;
+    conn.execute(r#"
+        CREATE TABLE windows (
+            sample_name VARCHAR,
+            chrom VARCHAR,
+            start BIGINT,
+            "end" BIGINT,
+            num_sites BIGINT,
+            num_calls BIGINT,
+            mod_counts BIGINT
+        );
+    "#, [])?;
 
-    let query = format!(r#"
-        CREATE TABLE windows AS
-        WITH RECURSIVE offset_cte AS (
-            SELECT 1 AS win_offset
-            UNION ALL
-            SELECT win_offset + {step} FROM offset_cte WHERE win_offset + {step} < {window}
-        ),
-        window_map AS (
+    // Get list of all distinct samples to chunk the processing
+    let mut stmt = conn.prepare("SELECT DISTINCT sample_name FROM calls WHERE sample_name IS NOT NULL")?;
+    let samples: Vec<String> = stmt.query_map([], |row| row.get(0))?.filter_map(Result::ok).collect();
+
+    println!("Found {} samples. Processing iteratively to save memory...", samples.len());
+
+    let offsets: Vec<i64> = (1..window_size).step_by(step_size as usize).collect();
+
+    for samp in samples {
+        println!("  -> Aggregating base positions for sample: {}", samp);
+        let samp_esc = samp.replace("'", "''");
+
+        // Step 1: Base counts for THIS SAMPLE ONLY (With 5x pile-up cap)
+        conn.execute("DROP TABLE IF EXISTS temp_positions;", [])?;
+        let pos_sql = format!(r#"
+            CREATE TEMP TABLE temp_positions AS
             SELECT 
-                p.sample_name, p.chrom, p.start, 
-                p.num_calls, p.mod_counts,
-                (p.start - ((p.start - o.win_offset) % {window})) AS win_start
-            FROM base_counts p
-            CROSS JOIN offset_cte o
-        )
-        SELECT 
-            sample_name, chrom, 
-            win_start AS start, 
-            win_start + {window} - 1 AS "end",
-            COUNT(*) AS num_CpGs,
-            SUM(num_calls) AS num_calls,
-            SUM(mod_counts) AS mod_counts
-        FROM window_map
-        GROUP BY sample_name, chrom, win_start
-        HAVING SUM(num_calls) > 0;
-    "#, step = step_size, window = window_size);
+                chrom, 
+                CAST(start AS BIGINT) AS start, 
+                COUNT(*) AS num_calls, 
+                SUM(CASE WHEN call_code IN ('m', 'h') THEN 1 ELSE 0 END) AS mod_counts
+            FROM calls
+            WHERE sample_name = '{}' AND start IS NOT NULL
+            GROUP BY chrom, start;
+        "#, samp_esc);
+        conn.execute(&pos_sql, [])?;
 
-    conn.execute(&query, [])?;
-    
-    // SPEED TWEAK: Create a B-Tree index to supercharge downstream scripts
+        // Step 2: Loop through offsets iteratively just like the R script
+        for offset in &offsets {
+            let win_sql = format!(r#"
+                INSERT INTO windows
+                WITH window_map AS (
+                    SELECT 
+                        '{}' AS sample_name,
+                        chrom,
+                        -- Safe FLOOR math to prevent negative modulo corruption at chr starts
+                        {} + CAST(FLOOR((start - {}) / CAST({} AS DOUBLE)) AS BIGINT) * {} AS win_start,
+                        num_calls, 
+                        mod_counts
+                    FROM temp_positions
+                )
+                SELECT 
+                    sample_name, 
+                    chrom, 
+                    win_start AS start, 
+                    win_start + {} - 1 AS "end",
+                    COUNT(*) AS num_sites,
+                    SUM(num_calls) AS num_calls,
+                    SUM(mod_counts) AS mod_counts
+                FROM window_map
+                WHERE win_start >= 1
+                GROUP BY sample_name, chrom, win_start
+                HAVING SUM(num_calls) >= 1;
+            "#, samp_esc, offset, offset, window_size, window_size, window_size);
+            
+            conn.execute(&win_sql, [])?;
+        }
+    }
+
     println!("Step 3: Indexing database for high-speed downstream access...");
     conn.execute("CREATE INDEX idx_windows ON windows(chrom, start, \"end\");", [])?;
     
-    println!("Successfully created 'windows' table in the database!");
+    println!("Successfully built chunked 'windows' table!");
     Ok(())
 }

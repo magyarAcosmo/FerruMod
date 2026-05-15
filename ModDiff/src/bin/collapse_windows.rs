@@ -86,12 +86,18 @@ fn main() -> Result<()> {
     println!("Querying pooled read counts for final stats...");
     // FIX: Retrieve physical CpG count from base_counts to enforce spread inside the merged region
     let mut stmt = conn.prepare(r#"
-        SELECT m.chrom, m.start, m."end", m.win_count, b.sample_name, 
-               CAST(SUM(b.num_calls) AS DOUBLE), CAST(SUM(b.mod_counts) AS DOUBLE),
-               CAST(COUNT(b.start) AS DOUBLE) AS cpgs
-        FROM temp_merged m
-        JOIN base_counts b ON m.chrom = b.chrom AND b.start >= m.start AND b.start <= m."end"
-        GROUP BY m.chrom, m.start, m."end", m.win_count, b.sample_name
+        WITH region_calls AS (
+            SELECT c.sample_name, c.chrom, c.start as pos, c.call_code, 
+                   m.start as m_start, m."end" as m_end, m.win_count
+            FROM calls c
+            JOIN temp_merged m ON c.chrom = m.chrom AND c.start >= m.start AND c.start <= m."end"
+        )
+        SELECT chrom, m_start, m_end, win_count, sample_name, 
+               CAST(COUNT(*) AS DOUBLE) AS num_calls, 
+               CAST(SUM(CASE WHEN call_code IN ('m', 'h') THEN 1 ELSE 0 END) AS DOUBLE) AS mod_counts,
+               CAST(COUNT(DISTINCT pos) AS DOUBLE) AS cpgs
+        FROM region_calls
+        GROUP BY chrom, m_start, m_end, win_count, sample_name
     "#)?;
     
     let rows = stmt.query_map([], |row| {
