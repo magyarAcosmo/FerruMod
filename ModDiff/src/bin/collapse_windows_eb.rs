@@ -12,6 +12,9 @@ struct BetaBinomialGLM { ks: Vec<f64>, ns: Vec<f64>, covariates: Vec<Vec<f64>>, 
 impl CostFunction for BetaBinomialGLM {
     type Param = Vec<f64>; type Output = f64;
     fn cost(&self, p: &Self::Param) -> std::result::Result<Self::Output, argmin::core::Error> {
+        for param in p {
+            if *param < -15.0 || *param > 15.0 { return Ok(f64::INFINITY); }
+        }
         let mut ll = 0.0;
         for i in 0..self.ks.len() {
             let (k, n) = (self.ks[i], self.ns[i]);
@@ -24,7 +27,9 @@ impl CostFunction for BetaBinomialGLM {
                 + ln_gamma(k + a) + ln_gamma(n - k + b) - ln_gamma(n + a + b)
                 + ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b);
         }
-        Ok(-ll)
+        let mut penalty = 0.0; let penalty_weight = 0.05;
+        for param in p { penalty += penalty_weight * param.powi(2); }
+        Ok(-ll + penalty)
     }
 }
 
@@ -81,31 +86,34 @@ fn main() -> Result<()> {
     println!("Querying pooled read counts for Empirical Bayes Shrinkage...");
     let mut stmt = conn.prepare(r#"
         SELECT m.chrom, m.start, m."end", m.win_count, b.sample_name, 
-               CAST(SUM(b.num_calls) AS DOUBLE), CAST(SUM(b.mod_counts) AS DOUBLE)
+               CAST(SUM(b.num_calls) AS DOUBLE), CAST(SUM(b.mod_counts) AS DOUBLE),
+               CAST(COUNT(b.start) AS DOUBLE) AS cpgs
         FROM temp_merged m
         JOIN base_counts b ON m.chrom = b.chrom AND b.start >= m.start AND b.start <= m."end"
         GROUP BY m.chrom, m.start, m."end", m.win_count, b.sample_name
     "#)?;
+    
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?, row.get::<_, f64>(5)?, row.get::<_, f64>(6)?))
+            row.get::<_, String>(4)?, row.get::<_, f64>(5)?, row.get::<_, f64>(6)?, row.get::<_, f64>(7)?))
     })?;
 
-    let mut win_data: HashMap<(String, i64, i64, i64), Vec<(String, f64, f64)>> = HashMap::new();
+    let mut win_data: HashMap<(String, i64, i64, i64), Vec<(String, f64, f64, f64)>> = HashMap::new();
     for r in rows {
-        let (chrom, start, end, win_count, sample, n, k) = r?;
-        win_data.entry((chrom, start, end, win_count)).or_default().push((sample, n, k));
+        let (chrom, start, end, win_count, sample, n, k, cpgs) = r?;
+        win_data.entry((chrom, start, end, win_count)).or_default().push((sample, n, k, cpgs));
     }
 
-    println!("Filtering collapsed EB regions by minimum depth (>= {} reads per group)...", min_depth);
+    println!("Filtering collapsed EB regions by depth and spatial CpGs...");
     win_data.retain(|_, samples| {
-        let mut g0_depth = 0.0; let mut g1_depth = 0.0;
-        for (samp, n, _) in samples {
+        let mut g0_depth = 0.0; let mut g1_depth = 0.0; let mut max_cpgs = 0.0;
+        for (samp, n, _, cpgs) in samples {
+            if *cpgs > max_cpgs { max_cpgs = *cpgs; }
             if let Some(meta) = meta_map.get(samp) {
                 if meta.group == 0.0 { g0_depth += *n; } else { g1_depth += *n; }
             }
         }
-        g0_depth >= min_depth && g1_depth >= min_depth
+        g0_depth >= min_depth.max(1.0) && g1_depth >= min_depth.max(1.0) && max_cpgs >= 5.0
     });
 
     println!("Pass 1: Estimating raw dispersion across POOLED regions...");
@@ -114,10 +122,10 @@ fn main() -> Result<()> {
         let s_count = samples.len() as f64; let mut raw_rho = 1e-4; 
         if s_count > 1.0 {
             let (mut total_n, mut total_k) = (0.0, 0.0);
-            for (_, n, k) in samples { total_n += n; total_k += k; }
+            for (_, n, k, _) in samples { total_n += n; total_k += k; }
             let p_bar = total_k / total_n; let n_bar = total_n / s_count;
             let mut s2 = 0.0;
-            for (_, n, k) in samples { let p_s = k / n; s2 += (p_s - p_bar).powi(2); }
+            for (_, n, k, _) in samples { let p_s = k / n; s2 += (p_s - p_bar).powi(2); }
             s2 /= s_count - 1.0;
             let binom_v = (p_bar * (1.0 - p_bar)) / n_bar;
             if s2 > binom_v && p_bar > 0.0 && p_bar < 1.0 { raw_rho = (s2 - binom_v) / ((p_bar * (1.0 - p_bar)) - binom_v).max(1e-10); }
@@ -136,14 +144,13 @@ fn main() -> Result<()> {
         let mut ks = Vec::with_capacity(capacity); let mut ns = Vec::with_capacity(capacity);
         let mut cov_full = Vec::with_capacity(capacity); let mut cov_null = Vec::with_capacity(capacity);
 
-        // Smart start calculation
         let (mut total_n, mut total_k) = (0.0, 0.0);
-        for (_, n, k) in &samples { total_n += n; total_k += k; }
+        for (_, n, k, _) in &samples { total_n += n; total_k += k; }
         let mut p_avg = if total_n > 0.0 { total_k / total_n } else { 0.5 };
         p_avg = p_avg.clamp(1e-4, 1.0 - 1e-4);
         let intercept_start = (p_avg / (1.0 - p_avg)).ln();
 
-        for (samp, n, k) in samples {
+        for (samp, n, k, _) in samples {
             if let Some(meta) = meta_map.get(&samp) {
                 ks.push(k); ns.push(n);
                 let mut f_row = vec![1.0, meta.group]; let mut n_row = vec![1.0];             
@@ -160,16 +167,9 @@ fn main() -> Result<()> {
         let cost_null = BetaBinomialGLM { ks, ns, covariates: cov_null, rho: rho_shrunk };
 
         let mut simplex_full = vec![vec![0.0; full_params]; full_params + 1];
-        for i in 0..=full_params { 
-            simplex_full[i][0] = intercept_start; 
-            if i > 0 { simplex_full[i][i-1] = 0.5; } 
-        }
-        
+        for i in 0..=full_params { simplex_full[i][0] = intercept_start; if i > 0 { simplex_full[i][i-1] = 0.5; } }
         let mut simplex_null = vec![vec![0.0; null_params]; null_params + 1];
-        for i in 0..=null_params { 
-            simplex_null[i][0] = intercept_start; 
-            if i > 0 { simplex_null[i][i-1] = 0.5; } 
-        }
+        for i in 0..=null_params { simplex_null[i][0] = intercept_start; if i > 0 { simplex_null[i][i-1] = 0.5; } }
 
         let s_full = NelderMead::new(simplex_full).with_sd_tolerance(1e-6).unwrap();
         let s_null = NelderMead::new(simplex_null).with_sd_tolerance(1e-6).unwrap();
@@ -178,8 +178,23 @@ fn main() -> Result<()> {
         let r_null = Executor::new(cost_null, s_null).configure(|state| state.max_iters(2500)).run();
 
         let mut diff_beta = 0.0_f64; let mut ll_full = 0.0_f64; let mut ll_null = 0.0_f64;
-        if let Ok(opt) = r_full { ll_full = -opt.state().get_best_cost(); diff_beta = opt.state().get_best_param().unwrap()[1]; }
-        if let Ok(opt) = r_null { ll_null = -opt.state().get_best_cost(); }
+        
+        if let Ok(opt) = r_full { 
+            let params = opt.state().get_best_param().unwrap();
+            let mut penalty = 0.0; for p in params { penalty += 0.05 * (*p).powi(2); }
+            ll_full = -(opt.state().get_best_cost() - penalty); 
+            
+            let intercept = params[0]; let diff_log = params[1];
+            let mu_ctrl = intercept.exp() / (1.0 + intercept.exp());
+            let case_logit = intercept + diff_log;
+            let mu_case = case_logit.exp() / (1.0 + case_logit.exp());
+            diff_beta = mu_case - mu_ctrl;
+        }
+        if let Ok(opt) = r_null { 
+            let params = opt.state().get_best_param().unwrap();
+            let mut penalty = 0.0; for p in params { penalty += 0.05 * (*p).powi(2); }
+            ll_null = -(opt.state().get_best_cost() - penalty); 
+        }
 
         let lr_stat = (2.0 * (ll_full - ll_null)).max(1e-10_f64);
         let p_value = 1.0 - ChiSquared::new(1.0).unwrap().cdf(lr_stat);
