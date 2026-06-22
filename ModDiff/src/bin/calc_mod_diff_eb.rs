@@ -1,5 +1,5 @@
 use anyhow::Result;
-use argmin::core::{CostFunction, Executor, State};
+use argmin::core::{CostFunction, Executor};
 use argmin::solver::neldermead::NelderMead;
 use duckdb::Connection;
 use rayon::prelude::*;
@@ -27,9 +27,9 @@ impl CostFunction for BetaBinomialGLM {
                 + ln_gamma(k + a) + ln_gamma(n - k + b) - ln_gamma(n + a + b)
                 + ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b);
         }
-        let mut penalty = 0.0; let penalty_weight = 0.05;
-        for param in p { penalty += penalty_weight * param.powi(2); }
-        Ok(-ll + penalty)
+        
+        // L2 Penalty removed: model now uses pure Maximum Likelihood Estimation
+        Ok(-ll)
     }
 }
 
@@ -123,15 +123,27 @@ fn main() -> Result<()> {
         p_avg = p_avg.clamp(1e-4, 1.0 - 1e-4);
         let intercept_start = (p_avg / (1.0 - p_avg)).ln();
 
+        let (mut k_ctrl, mut n_ctrl) = (0.0, 0.0);
+        let (mut k_case, mut n_case) = (0.0, 0.0);
+
         for (samp, n, k, _) in samples {
             if let Some(meta) = meta_map.get(&samp) {
                 ks.push(k); ns.push(n);
+                
+                // Collect read counts for raw arithmetic difference calculation
+                if meta.group == 0.0 { k_ctrl += k; n_ctrl += n; } 
+                else { k_case += k; n_case += n; }
+
                 let mut f_row = vec![1.0, meta.group]; let mut n_row = vec![1.0];             
                 f_row.extend(&meta.covariates); n_row.extend(&meta.covariates);
                 cov_full.push(f_row); cov_null.push(n_row);
             }
         }
         if ks.is_empty() { return None; }
+
+        let raw_mu_ctrl = if n_ctrl > 0.0 { k_ctrl / n_ctrl } else { 0.0 };
+        let raw_mu_case = if n_case > 0.0 { k_case / n_case } else { 0.0 };
+        let raw_diff_beta = raw_mu_case - raw_mu_ctrl;
 
         let raw_rho = raw_rhos_map.get(&(chrom.clone(), start, end)).unwrap();
         let df_prior = 10.0; 
@@ -151,29 +163,15 @@ fn main() -> Result<()> {
         let r_full = Executor::new(cost_full, s_full).configure(|state| state.max_iters(2500)).run();
         let r_null = Executor::new(cost_null, s_null).configure(|state| state.max_iters(2500)).run();
 
-        let mut diff_beta = 0.0_f64; let mut ll_full = 0.0_f64; let mut ll_null = 0.0_f64;
+        let mut ll_full = 0.0_f64; let mut ll_null = 0.0_f64;
         
-        if let Ok(opt) = r_full { 
-            let params = opt.state().get_best_param().unwrap();
-            let mut penalty = 0.0; for p in params { penalty += 0.05 * (*p).powi(2); }
-            ll_full = -(opt.state().get_best_cost() - penalty); 
-            
-            let intercept = params[0]; let diff_log = params[1];
-            let mu_ctrl = intercept.exp() / (1.0 + intercept.exp());
-            let case_logit = intercept + diff_log;
-            let mu_case = case_logit.exp() / (1.0 + case_logit.exp());
-            diff_beta = mu_case - mu_ctrl;
-        }
-        if let Ok(opt) = r_null { 
-            let params = opt.state().get_best_param().unwrap();
-            let mut penalty = 0.0; for p in params { penalty += 0.05 * (*p).powi(2); }
-            ll_null = -(opt.state().get_best_cost() - penalty); 
-        }
+        if let Ok(opt) = r_full { ll_full = -opt.state().get_best_cost(); }
+        if let Ok(opt) = r_null { ll_null = -opt.state().get_best_cost(); }
 
         let lr_stat = (2.0 * (ll_full - ll_null)).max(1e-10_f64);
         let p_value = 1.0 - ChiSquared::new(1.0).unwrap().cdf(lr_stat);
 
-        Some((chrom, start, end, diff_beta, p_value, rho_shrunk))
+        Some((chrom, start, end, raw_diff_beta, p_value, rho_shrunk))
     }).filter_map(|x| x).collect();
 
     println!("Applying Benjamini-Hochberg Correction...");
