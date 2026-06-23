@@ -12,6 +12,7 @@ dependencies = [
  "csv",
  "duckdb",
  "polars",
+ "rand 0.8.6",
  "rayon",
  "statrs",
 ]
