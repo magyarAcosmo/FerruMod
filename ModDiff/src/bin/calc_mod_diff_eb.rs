@@ -107,9 +107,29 @@ fn main() -> Result<()> {
         rhos_vec.push(raw_rho);
     }
 
-    println!("Pass 2: Calculating EB Global Prior...");
+    println!("Pass 2: Calculating EB Global Prior and Dynamic Degrees of Freedom...");
     rhos_vec.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let global_prior = if rhos_vec.is_empty() { 0.05 } else { rhos_vec[rhos_vec.len() / 2] };
+
+    // Method of Moments for True EB df_prior estimation
+    let mut rho_variance = 0.0;
+    let mut mean_rho = 0.05;
+    if rhos_vec.len() > 1 {
+        mean_rho = rhos_vec.iter().sum::<f64>() / rhos_vec.len() as f64;
+        let sum_sq_diff: f64 = rhos_vec.iter().map(|&x| (x - mean_rho).powi(2)).sum();
+        rho_variance = sum_sq_diff / (rhos_vec.len() as f64 - 1.0);
+    }
+
+    let mut estimated_df = 2.0;
+    if rho_variance > 1e-8 {
+        estimated_df = (mean_rho * (1.0 - mean_rho) / rho_variance) - 1.0;
+    }
+    
+    // Clamp the df_prior to mathematically safe bounds
+    let df_prior = estimated_df.clamp(1.0, 100.0);
+    
+    println!(" -> Global Prior (Median Rho): {:.4}", global_prior);
+    println!(" -> Estimated True df_prior: {:.2}", df_prior);
 
     println!("Pass 3: Running Shrunk Beta-Binomial in Parallel...");
     let raw_results: Vec<_> = win_data.into_par_iter().map(|((chrom, start, end), samples)| {
@@ -146,7 +166,8 @@ fn main() -> Result<()> {
         let raw_diff_beta = raw_mu_case - raw_mu_ctrl;
 
         let raw_rho = raw_rhos_map.get(&(chrom.clone(), start, end)).unwrap();
-        let df_prior = 10.0; 
+        
+        // Use dynamically calculated True EB prior
         let rho_shrunk = ((raw_rho * s_count) + (global_prior * df_prior)) / (s_count + df_prior);
 
         let cost_full = BetaBinomialGLM { ks: ks.clone(), ns: ns.clone(), covariates: cov_full, rho: rho_shrunk };
