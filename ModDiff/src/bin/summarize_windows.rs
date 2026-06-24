@@ -41,13 +41,14 @@ fn main() -> Result<()> {
 
     println!("Found {} samples. Processing iteratively to save memory...", samples.len());
 
-    let offsets: Vec<i64> = (1..window_size).step_by(step_size as usize).collect();
+    // Fix: Start offsets at 0 for 0-based coordinates
+    let offsets: Vec<i64> = (0..window_size).step_by(step_size as usize).collect();
 
     for samp in samples {
         println!("  -> Aggregating base positions for sample: {}", samp);
         let samp_esc = samp.replace("'", "''");
 
-        // Step 1: Base counts for THIS SAMPLE ONLY (With 5x pile-up cap)
+        // Step 1: Base counts for THIS SAMPLE ONLY
         conn.execute("DROP TABLE IF EXISTS temp_positions;", [])?;
         let pos_sql = format!(r#"
             CREATE TEMP TABLE temp_positions AS
@@ -80,12 +81,13 @@ fn main() -> Result<()> {
                     sample_name, 
                     chrom, 
                     win_start AS start, 
-                    win_start + {} - 1 AS "end",
+                    -- Fix: Removed the "- 1" to maintain half-open intervals
+                    win_start + {} AS "end",
                     COUNT(*) AS num_sites,
                     SUM(num_calls) AS num_calls,
                     SUM(mod_counts) AS mod_counts
                 FROM window_map
-                WHERE win_start >= 1
+                WHERE win_start >= 0  -- Fix: changed from 1 to 0
                 GROUP BY sample_name, chrom, win_start
                 HAVING SUM(num_calls) >= 1;
             "#, samp_esc, offset, offset, window_size, window_size, window_size);
