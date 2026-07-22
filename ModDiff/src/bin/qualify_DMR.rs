@@ -3,7 +3,7 @@ use duckdb::{params, Connection};
 use std::collections::HashMap;
 use std::env;
 
-const REQUIRED_SAMPLE_FRACTION: f64 = 0.80;
+const REQUIRED_SAMPLE_FRACTION: f64 = 0.30 ;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Group {
