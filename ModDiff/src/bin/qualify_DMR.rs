@@ -63,6 +63,89 @@ struct Thresholds {
     max_variance: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FilterResults {
+    meth_diff: bool,
+    case_group_coverage: bool,
+    control_group_coverage: bool,
+    case_sample_coverage: bool,
+    control_sample_coverage: bool,
+    case_variance: bool,
+    control_variance: bool,
+}
+
+impl FilterResults {
+    fn group_coverage(self) -> bool {
+        self.case_group_coverage && self.control_group_coverage
+    }
+
+    fn sample_coverage(self) -> bool {
+        self.case_sample_coverage && self.control_sample_coverage
+    }
+
+    fn variance(self) -> bool {
+        self.case_variance && self.control_variance
+    }
+
+    fn all(self) -> bool {
+        self.meth_diff
+            && self.group_coverage()
+            && self.sample_coverage()
+            && self.variance()
+    }
+}
+
+#[derive(Debug, Default)]
+struct FilterStats {
+    total: usize,
+    usable: usize,
+    meth_diff: usize,
+    case_group_coverage: usize,
+    control_group_coverage: usize,
+    group_coverage: usize,
+    case_sample_coverage: usize,
+    control_sample_coverage: usize,
+    sample_coverage: usize,
+    case_variance: usize,
+    control_variance: usize,
+    variance: usize,
+    after_meth_diff: usize,
+    after_group_coverage: usize,
+    after_sample_coverage: usize,
+    after_variance: usize,
+}
+
+impl FilterStats {
+    fn observe(&mut self, filters: FilterResults) {
+        self.usable += 1;
+        self.meth_diff += usize::from(filters.meth_diff);
+        self.case_group_coverage += usize::from(filters.case_group_coverage);
+        self.control_group_coverage += usize::from(filters.control_group_coverage);
+        self.group_coverage += usize::from(filters.group_coverage());
+        self.case_sample_coverage += usize::from(filters.case_sample_coverage);
+        self.control_sample_coverage += usize::from(filters.control_sample_coverage);
+        self.sample_coverage += usize::from(filters.sample_coverage());
+        self.case_variance += usize::from(filters.case_variance);
+        self.control_variance += usize::from(filters.control_variance);
+        self.variance += usize::from(filters.variance());
+
+        let after_meth_diff = filters.meth_diff;
+        let after_group_coverage = after_meth_diff && filters.group_coverage();
+        let after_sample_coverage = after_group_coverage && filters.sample_coverage();
+        let after_variance = after_sample_coverage && filters.variance();
+        self.after_meth_diff += usize::from(after_meth_diff);
+        self.after_group_coverage += usize::from(after_group_coverage);
+        self.after_sample_coverage += usize::from(after_sample_coverage);
+        self.after_variance += usize::from(after_variance);
+    }
+}
+
+#[derive(Debug)]
+struct QualificationRun {
+    qualified: Vec<QualifiedWindow>,
+    stats: FilterStats,
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 7 {
@@ -100,16 +183,17 @@ fn main() -> Result<()> {
     ))?;
 
     println!("Evaluating windows...");
-    let qualified = qualify_windows(
+    let run = qualify_windows(
         &conn,
         &metadata,
         case_count,
         control_count,
         thresholds,
     )?;
-    println!("Qualified {} windows.", qualified.len());
+    print_filter_stats(&run.stats, thresholds);
+    println!("Qualified {} windows.", run.qualified.len());
 
-    let dmrs = collapse_windows(qualified);
+    let dmrs = collapse_windows(run.qualified);
     save_dmrs(&conn, &dmrs)?;
     println!(
         "Saved {} collapsed regions to 'qualified_DMRs'.",
@@ -173,7 +257,7 @@ fn qualify_windows(
     case_count: usize,
     control_count: usize,
     thresholds: Thresholds,
-) -> Result<Vec<QualifiedWindow>> {
+) -> Result<QualificationRun> {
     let mut statement = conn.prepare(
         r#"SELECT chrom, start, "end", sample_name,
                   CAST(num_sites AS DOUBLE), CAST(num_calls AS DOUBLE),
@@ -186,6 +270,7 @@ fn qualify_windows(
     let mut rows = statement.query([])?;
     let mut current: Option<WindowCounts> = None;
     let mut qualified = Vec::new();
+    let mut stats = FilterStats::default();
 
     while let Some(row) = rows.next()? {
         let chrom: String = row.get(0)?;
@@ -204,15 +289,15 @@ fn qualify_windows(
             .unwrap_or(false);
         if is_new {
             if let Some(window) = current.take() {
-                if let Some(result) = qualify_one(
+                evaluate_window(
                     window,
                     metadata,
                     case_count,
                     control_count,
                     thresholds,
-                ) {
-                    qualified.push(result);
-                }
+                    &mut qualified,
+                    &mut stats,
+                );
             }
         }
 
@@ -229,26 +314,50 @@ fn qualify_windows(
     }
 
     if let Some(window) = current {
-        if let Some(result) = qualify_one(
+        evaluate_window(
             window,
             metadata,
             case_count,
             control_count,
             thresholds,
-        ) {
-            qualified.push(result);
-        }
+            &mut qualified,
+            &mut stats,
+        );
     }
-    Ok(qualified)
+    Ok(QualificationRun { qualified, stats })
 }
 
-fn qualify_one(
+fn evaluate_window(
     window: WindowCounts,
     metadata: &HashMap<String, Group>,
     case_count: usize,
     control_count: usize,
     thresholds: Thresholds,
-) -> Option<QualifiedWindow> {
+    qualified: &mut Vec<QualifiedWindow>,
+    stats: &mut FilterStats,
+) {
+    stats.total += 1;
+    if let Some((result, filters)) = evaluate_one(
+        window,
+        metadata,
+        case_count,
+        control_count,
+        thresholds,
+    ) {
+        stats.observe(filters);
+        if filters.all() {
+            qualified.push(result);
+        }
+    }
+}
+
+fn evaluate_one(
+    window: WindowCounts,
+    metadata: &HashMap<String, Group>,
+    case_count: usize,
+    control_count: usize,
+    thresholds: Thresholds,
+) -> Option<(QualifiedWindow, FilterResults)> {
     let mut case_total = Counts::default();
     let mut control_total = Counts::default();
     let mut case_methylation = Vec::new();
@@ -308,29 +417,114 @@ fn qualify_one(
     let meth_diff = case_total.modified / case_total.calls
         - control_total.modified / control_total.calls;
 
-    if meth_diff.abs() < thresholds.min_meth_diff
-        || case_coverage < thresholds.min_group_coverage
-        || control_coverage < thresholds.min_group_coverage
-        || case_fraction < REQUIRED_SAMPLE_FRACTION
-        || control_fraction < REQUIRED_SAMPLE_FRACTION
-        || case_variance > thresholds.max_variance
-        || control_variance > thresholds.max_variance
-    {
-        return None;
-    }
+    let filters = FilterResults {
+        meth_diff: meth_diff.abs() >= thresholds.min_meth_diff,
+        case_group_coverage: case_coverage >= thresholds.min_group_coverage,
+        control_group_coverage: control_coverage >= thresholds.min_group_coverage,
+        case_sample_coverage: case_fraction >= REQUIRED_SAMPLE_FRACTION,
+        control_sample_coverage: control_fraction >= REQUIRED_SAMPLE_FRACTION,
+        case_variance: case_variance <= thresholds.max_variance,
+        control_variance: control_variance <= thresholds.max_variance,
+    };
 
-    Some(QualifiedWindow {
-        chrom: window.chrom,
-        start: window.start,
-        end: window.end,
-        meth_diff,
-        case_coverage,
-        control_coverage,
-        case_passing_pct: 100.0 * case_fraction,
-        control_passing_pct: 100.0 * control_fraction,
-        case_variance,
-        control_variance,
-    })
+    Some((
+        QualifiedWindow {
+            chrom: window.chrom,
+            start: window.start,
+            end: window.end,
+            meth_diff,
+            case_coverage,
+            control_coverage,
+            case_passing_pct: 100.0 * case_fraction,
+            control_passing_pct: 100.0 * control_fraction,
+            case_variance,
+            control_variance,
+        },
+        filters,
+    ))
+}
+
+#[cfg(test)]
+fn qualify_one(
+    window: WindowCounts,
+    metadata: &HashMap<String, Group>,
+    case_count: usize,
+    control_count: usize,
+    thresholds: Thresholds,
+) -> Option<QualifiedWindow> {
+    evaluate_one(window, metadata, case_count, control_count, thresholds)
+        .and_then(|(result, filters)| filters.all().then_some(result))
+}
+
+fn print_filter_stats(stats: &FilterStats, thresholds: Thresholds) {
+    println!("Filter diagnostics (candidate-window counts):");
+    println!("  Total windows read: {}", stats.total);
+    println!(
+        "  Usable data in both groups: {} ({} excluded before threshold checks)",
+        stats.usable,
+        stats.total - stats.usable
+    );
+    println!(
+        "  {:<68} {:>12} {:>12} {:>12}",
+        "Threshold", "Pass alone", "Removed here", "Remaining"
+    );
+    println!(
+        "  {:<68} {:>12} {:>12} {:>12}",
+        format!(
+            "min_meth_diff: |methylation difference| >= {}",
+            thresholds.min_meth_diff
+        ),
+        stats.meth_diff,
+        stats.usable - stats.after_meth_diff,
+        stats.after_meth_diff
+    );
+    println!(
+        "  {:<68} {:>12} {:>12} {:>12}",
+        format!(
+            "min_group_coverage: coverage >= {} in both groups",
+            thresholds.min_group_coverage
+        ),
+        stats.group_coverage,
+        stats.after_meth_diff - stats.after_group_coverage,
+        stats.after_group_coverage
+    );
+    println!(
+        "    case: {}; control: {}",
+        stats.case_group_coverage, stats.control_group_coverage
+    );
+    println!(
+        "  {:<68} {:>12} {:>12} {:>12}",
+        format!(
+            "min_sample_coverage: coverage >= {} in >= {:.0}% of both groups",
+            thresholds.min_sample_coverage,
+            100.0 * REQUIRED_SAMPLE_FRACTION
+        ),
+        stats.sample_coverage,
+        stats.after_group_coverage - stats.after_sample_coverage,
+        stats.after_sample_coverage
+    );
+    println!(
+        "    case: {}; control: {}",
+        stats.case_sample_coverage, stats.control_sample_coverage
+    );
+    println!(
+        "  {:<68} {:>12} {:>12} {:>12}",
+        format!(
+            "max_variance: inter-sample variance <= {} in both groups",
+            thresholds.max_variance
+        ),
+        stats.variance,
+        stats.after_sample_coverage - stats.after_variance,
+        stats.after_variance
+    );
+    println!(
+        "    case: {}; control: {}",
+        stats.case_variance, stats.control_variance
+    );
+    println!("  'Pass alone' uses all windows with usable case/control data.");
+    println!(
+        "  'Removed here' and 'Remaining' apply thresholds cumulatively top to bottom."
+    );
 }
 
 fn add_counts(total: &mut Counts, value: &Counts) {
@@ -552,6 +746,40 @@ mod tests {
             5,
             thresholds(),
         ).is_none());
+    }
+
+    #[test]
+    fn filter_stats_track_independent_and_cumulative_counts() {
+        let mut stats = FilterStats::default();
+        stats.total = 3;
+        stats.observe(FilterResults {
+            meth_diff: true,
+            case_group_coverage: true,
+            control_group_coverage: true,
+            case_sample_coverage: false,
+            control_sample_coverage: true,
+            case_variance: true,
+            control_variance: true,
+        });
+        stats.observe(FilterResults {
+            meth_diff: false,
+            case_group_coverage: true,
+            control_group_coverage: true,
+            case_sample_coverage: true,
+            control_sample_coverage: true,
+            case_variance: true,
+            control_variance: true,
+        });
+
+        assert_eq!(stats.usable, 2);
+        assert_eq!(stats.meth_diff, 1);
+        assert_eq!(stats.group_coverage, 2);
+        assert_eq!(stats.sample_coverage, 1);
+        assert_eq!(stats.variance, 2);
+        assert_eq!(stats.after_meth_diff, 1);
+        assert_eq!(stats.after_group_coverage, 1);
+        assert_eq!(stats.after_sample_coverage, 0);
+        assert_eq!(stats.after_variance, 0);
     }
 
     #[test]
