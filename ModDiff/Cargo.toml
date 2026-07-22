@@ -15,6 +15,10 @@ path = "src/bin/calc_mod_diff.rs"
 name = "collapse_windows"
 path = "src/bin/collapse_windows.rs"
 
+[[bin]]
+name = "qualify_DMR"
+path = "src/bin/qualify_DMR.rs"
+
 # --- NEW EMPIRICAL BAYES TRACK ---
 [[bin]]
 name = "calc_mod_diff_eb"
