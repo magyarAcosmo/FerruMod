@@ -363,6 +363,10 @@ fn evaluate_one(
     let mut case_methylation = Vec::new();
     let mut control_methylation = Vec::new();
     let (mut case_passing, mut control_passing) = (0usize, 0usize);
+    // num_sites describes the window, so count it once when calculating
+    // pooled group coverage. MAX is deterministic if sparse samples report
+    // fewer covered sites than other samples in the same window.
+    let mut window_sites = 0.0_f64;
 
     for (sample, counts) in &window.samples {
         let Some(group) = metadata.get(sample) else {
@@ -380,17 +384,18 @@ fn evaluate_one(
         }
         let sample_coverage = counts.calls / counts.sites;
         let methylation = (counts.calls > 0.0).then_some(counts.modified / counts.calls);
+        window_sites = window_sites.max(counts.sites);
 
         match group {
             Group::Case => {
-                add_counts(&mut case_total, counts);
+                add_group_counts(&mut case_total, counts);
                 case_passing += usize::from(sample_coverage >= thresholds.min_sample_coverage);
                 if let Some(value) = methylation {
                     case_methylation.push(value);
                 }
             }
             Group::Control => {
-                add_counts(&mut control_total, counts);
+                add_group_counts(&mut control_total, counts);
                 control_passing +=
                     usize::from(sample_coverage >= thresholds.min_sample_coverage);
                 if let Some(value) = methylation {
@@ -400,16 +405,15 @@ fn evaluate_one(
         }
     }
 
-    if case_total.sites <= 0.0
-        || control_total.sites <= 0.0
+    if window_sites <= 0.0
         || case_total.calls <= 0.0
         || control_total.calls <= 0.0
     {
         return None;
     }
 
-    let case_coverage = case_total.calls / case_total.sites;
-    let control_coverage = control_total.calls / control_total.sites;
+    let case_coverage = case_total.calls / window_sites;
+    let control_coverage = control_total.calls / window_sites;
     let case_fraction = case_passing as f64 / case_count as f64;
     let control_fraction = control_passing as f64 / control_count as f64;
     let case_variance = population_variance(&case_methylation);
@@ -527,8 +531,7 @@ fn print_filter_stats(stats: &FilterStats, thresholds: Thresholds) {
     );
 }
 
-fn add_counts(total: &mut Counts, value: &Counts) {
-    total.sites += value.sites;
+fn add_group_counts(total: &mut Counts, value: &Counts) {
     total.calls += value.calls;
     total.modified += value.modified;
 }
@@ -691,6 +694,8 @@ mod tests {
         };
         let result = qualify_one(window, &metadata, 2, 2, thresholds()).unwrap();
         assert!((result.meth_diff - 0.4).abs() < 1e-12);
+        assert_eq!(result.case_coverage, 5.0);
+        assert_eq!(result.control_coverage, 4.0);
         assert_eq!(result.case_passing_pct, 100.0);
         assert_eq!(result.case_variance, 0.0);
     }
